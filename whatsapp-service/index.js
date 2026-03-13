@@ -212,7 +212,12 @@ const EDGE_VOICE_STYLE = {
 function cleanTextForTTS(text) {
     if (!text) return ''
     let clean = text
-    // Remove emojis Unicode (range completo: emoticons, símbolos, transporte, misc)
+
+    // Remove risadas informais (kkk, haha, rsrs, lol, huhu, etc.)
+    // A voz neural já tem entonação — ler "cácácá" soa robótico
+    clean = clean.replace(/\b(k{2,}|ha(ha)+|rs(rs)*|lol+|hu(hu)+|he(he)+|ih+|ui+)\b/gi, ' ')
+
+    // Remove emojis Unicode (range completo)
     clean = clean.replace(/[\u{1F000}-\u{1FFFF}\u{2600}-\u{27BF}\u{2300}-\u{23FF}\u{2B00}-\u{2BFF}\u{FE00}-\u{FE0F}\u{1FA00}-\u{1FAFF}]/gu, ' ')
     // Remove variações de emoji e ZWJ sequences
     clean = clean.replace(/[\uFE0F\u200D\u20E3]/g, '')
@@ -257,13 +262,19 @@ async function generateAudio(text, configs) {
             }
 
             try {
-                console.log(`[TTS] Edge-TTS → ${voiceId}`)
+                // Lê parâmetros de prosódia do dashboard (defaults: velocidade leve, sem alteração de tom/volume)
+            const ttsRate   = ttsCfg.rate   || '-5%'
+            const ttsPitch  = ttsCfg.pitch  || '+0Hz'
+            const ttsVolume = ttsCfg.volume || '+0%'
 
-                await execFileAsync('edge-tts', [
-                    '--voice', voiceId,
-                    '--text', cleanText,
-                    '--write-media', tmpMp3
-                ], { timeout: 25000 })
+            console.log(`[TTS] Edge-TTS → ${voiceId} | rate:${ttsRate} pitch:${ttsPitch} volume:${ttsVolume}`)
+
+                const edgeArgs = ['--voice', voiceId, '--text', cleanText, '--write-media', tmpMp3]
+                if (ttsRate   && ttsRate   !== '+0%'  && ttsRate   !== '0%')  edgeArgs.splice(2, 0, '--rate',   ttsRate)
+                if (ttsPitch  && ttsPitch  !== '+0Hz' && ttsPitch  !== '0Hz') edgeArgs.splice(2, 0, '--pitch',  ttsPitch)
+                if (ttsVolume && ttsVolume !== '+0%'  && ttsVolume !== '0%')  edgeArgs.splice(2, 0, '--volume', ttsVolume)
+
+                await execFileAsync('edge-tts', edgeArgs, { timeout: 25000 })
 
                 if (fs.existsSync(tmpMp3)) {
                     await execFileAsync('ffmpeg', [
@@ -651,7 +662,10 @@ async function loadTenantAIConfigs(tenantId) {
                     model: configs.tts_model || '',
                     voice_id: configs.tts_voice_id || 'pt-BR-FranciscaNeural',
                     enabled: configs.tts_enabled === 'true',
-                    audio_probability: parseFloat(configs.tts_audio_probability) || 0.3
+                    audio_probability: parseFloat(configs.tts_audio_probability) || 0.3,
+                    rate: configs.tts_rate || '-5%',
+                    pitch: configs.tts_pitch || '+0Hz',
+                    volume: configs.tts_volume || '+0%'
                 },
                 // Aprendizado / Memória
                 learning: {
@@ -702,10 +716,13 @@ async function loadTenantAIConfigs(tenantId) {
                 tts: {
                     provider: d.tts_provider || 'edge',
                     api_key: d.tts_api_key || '',
-                    model: d.tts_model || 'eleven_multilingual_v2',
-                    voice_id: d.tts_voice_id || '',
+                    model: d.tts_model || '',
+                    voice_id: d.tts_voice_id || 'pt-BR-FranciscaNeural',
                     enabled: d.tts_enabled === true || d.tts_enabled === 'true',
-                    audio_probability: parseFloat(d.tts_audio_probability) || 0.3
+                    audio_probability: parseFloat(d.tts_audio_probability) || 0.3,
+                    rate: d.tts_rate || '-5%',
+                    pitch: d.tts_pitch || '+0Hz',
+                    volume: d.tts_volume || '+0%'
                 },
                 learning: {
                     provider: d.learning_provider || d.ai_provider || 'gemini',
