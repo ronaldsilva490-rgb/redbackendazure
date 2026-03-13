@@ -256,16 +256,11 @@ async function generateAudio(text, configs) {
                 voiceId = 'pt-BR-FranciscaNeural'
             }
 
-            const voiceStyle = EDGE_VOICE_STYLE[voiceId] || { rate: '-5%', pitch: '+1Hz' }
-
             try {
-                console.log(`[TTS] Edge-TTS → ${voiceId} | rate:${voiceStyle.rate} pitch:${voiceStyle.pitch}`)
+                console.log(`[TTS] Edge-TTS → ${voiceId}`)
 
-                // execFileAsync com array evita problemas de shell com --rate e --pitch
                 await execFileAsync('edge-tts', [
                     '--voice', voiceId,
-                    '--rate', voiceStyle.rate,
-                    '--pitch', voiceStyle.pitch,
                     '--text', cleanText,
                     '--write-media', tmpMp3
                 ], { timeout: 25000 })
