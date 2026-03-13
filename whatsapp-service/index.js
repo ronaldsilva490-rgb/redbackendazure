@@ -262,19 +262,44 @@ async function generateAudio(text, configs) {
             }
 
             try {
-                // Lê parâmetros de prosódia do dashboard (defaults: velocidade leve, sem alteração de tom/volume)
+                // Lê parâmetros de prosódia do dashboard
             const ttsRate   = ttsCfg.rate   || '-5%'
             const ttsPitch  = ttsCfg.pitch  || '+0Hz'
             const ttsVolume = ttsCfg.volume || '+0%'
 
             console.log(`[TTS] Edge-TTS → ${voiceId} | rate:${ttsRate} pitch:${ttsPitch} volume:${ttsVolume}`)
 
-                const edgeArgs = ['--voice', voiceId, '--text', cleanText, '--write-media', tmpMp3]
-                if (ttsRate   && ttsRate   !== '+0%'  && ttsRate   !== '0%')  edgeArgs.splice(2, 0, '--rate',   ttsRate)
-                if (ttsPitch  && ttsPitch  !== '+0Hz' && ttsPitch  !== '0Hz') edgeArgs.splice(2, 0, '--pitch',  ttsPitch)
-                if (ttsVolume && ttsVolume !== '+0%'  && ttsVolume !== '0%')  edgeArgs.splice(2, 0, '--volume', ttsVolume)
+                // Usa Python script para chamar edge-tts API diretamente
+                // evita problema da CLI não aceitar valores negativos como --rate "-5%"
+                const pyScript = `
+import asyncio, sys, edge_tts
+async def run():
+    c = edge_tts.Communicate(
+        text=sys.argv[1],
+        voice=sys.argv[2],
+        rate=sys.argv[3],
+        pitch=sys.argv[4],
+        volume=sys.argv[5]
+    )
+    await c.save(sys.argv[6])
+asyncio.run(run())
+`.trim()
+                const pyFile = path.join('/tmp', `tts_py_${Date.now()}.py`)
+                fs.writeFileSync(pyFile, pyScript, 'utf8')
 
-                await execFileAsync('edge-tts', edgeArgs, { timeout: 25000 })
+                try {
+                    await execFileAsync('python3', [
+                        pyFile,
+                        cleanText,
+                        voiceId,
+                        ttsRate,
+                        ttsPitch,
+                        ttsVolume,
+                        tmpMp3
+                    ], { timeout: 25000 })
+                } finally {
+                    try { fs.unlinkSync(pyFile) } catch (_) {}
+                }
 
                 if (fs.existsSync(tmpMp3)) {
                     await execFileAsync('ffmpeg', [
