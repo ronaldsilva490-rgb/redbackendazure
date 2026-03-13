@@ -257,16 +257,18 @@ async function generateAudio(text, configs) {
             }
 
             const voiceStyle = EDGE_VOICE_STYLE[voiceId] || { rate: '-5%', pitch: '+1Hz' }
-            const safeText = cleanText.replace(/"/g, '\\"')
 
             try {
                 console.log(`[TTS] Edge-TTS → ${voiceId} | rate:${voiceStyle.rate} pitch:${voiceStyle.pitch}`)
 
-                // Usa --rate e --pitch para tom humanizado e descontraído
-                await execAsync(
-                    `edge-tts --voice "${voiceId}" --rate "${voiceStyle.rate}" --pitch "${voiceStyle.pitch}" --text "${safeText}" --write-media "${tmpMp3}"`,
-                    { timeout: 25000 }
-                )
+                // execFileAsync com array evita problemas de shell com --rate e --pitch
+                await execFileAsync('edge-tts', [
+                    '--voice', voiceId,
+                    '--rate', voiceStyle.rate,
+                    '--pitch', voiceStyle.pitch,
+                    '--text', cleanText,
+                    '--write-media', tmpMp3
+                ], { timeout: 25000 })
 
                 if (fs.existsSync(tmpMp3)) {
                     await execFileAsync('ffmpeg', [
