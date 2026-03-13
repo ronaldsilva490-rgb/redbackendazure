@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  backend:
+    build: .
+    container_name: redbackend-container
+    restart: always
+    ports:
+      - "7860:7860"
+    environment:
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
+      - WHATSAPP_PORT=3001
+      - ADMIN_TENANT_ID=${ADMIN_TENANT_ID}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - WHATSAPP_SERVICE_URL=http://localhost:3001
+    volumes:
+      - ./whatsapp_data:/data/auth_info_baileys
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10mb"
+        max-file: "3"

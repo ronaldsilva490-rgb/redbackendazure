@@ -1,0 +1,32 @@
+name: Deploy to Azure VM
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'backend/**'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.AZURE_VM_HOST }}
+          username: ${{ secrets.AZURE_VM_USER }}
+          password: ${{ secrets.AZURE_VM_PASSWORD }}
+          script: |
+            mkdir -p ~/redbackend
+            cd ~/redbackend
+            if [ ! -d ".git" ]; then
+              git clone https://github.com/ronaldsilva490-rgb/redbackendazure.git .
+            else
+              git pull origin main
+            fi
+            docker compose up -d --build
+            docker image prune -f
