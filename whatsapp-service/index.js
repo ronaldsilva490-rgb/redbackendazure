@@ -1299,5 +1299,54 @@ app.post('/send/:tenantId', async (req, res) => {
     }
 })
 
+// ══════════════════════════════════════════════════
+// AUTO-START — Restaura sessões salvas ao subir
+// ══════════════════════════════════════════════════
+async function autoStartSavedSessions() {
+    // Aguarda o Express estar pronto antes de conectar
+    await new Promise(r => setTimeout(r, 3000))
+
+    try {
+        // Busca todos os tenants que estavam autenticados no último estado salvo
+        const { data: savedSessions, error } = await supabase
+            .from('whatsapp_sessions')
+            .select('tenant_id')
+            .eq('status', 'authenticated')
+
+        if (error) {
+            console.error('[AUTO-START] Erro ao consultar Supabase:', error.message)
+            return
+        }
+
+        if (!savedSessions?.length) {
+            console.log('[AUTO-START] Nenhuma sessão salva para restaurar.')
+            return
+        }
+
+        console.log(`[AUTO-START] 🔄 ${savedSessions.length} sessão(ões) para restaurar...`)
+
+        for (const { tenant_id } of savedSessions) {
+            const authPath = path.join(__dirname, `auth_info_baileys/tenant_${tenant_id}`)
+            const credsFile = path.join(authPath, 'creds.json')
+
+            if (fs.existsSync(credsFile)) {
+                console.log(`[AUTO-START] ✅ Restaurando tenant: ${tenant_id}`)
+                connectToWhatsApp(tenant_id, false).catch(err =>
+                    console.error(`[AUTO-START] ❌ Falha ao restaurar ${tenant_id}:`, err.message)
+                )
+                // Intervalo entre tenants para não sobrecarregar
+                await new Promise(r => setTimeout(r, 2000))
+            } else {
+                console.log(`[AUTO-START] ⚠️  Tenant ${tenant_id}: creds.json não encontrado em ${authPath} — pulando.`)
+            }
+        }
+    } catch (err) {
+        console.error('[AUTO-START] Exceção:', err.message)
+    }
+}
+
 const PORT = process.env.WHATSAPP_PORT || 3001
-app.listen(PORT, () => console.log(`🚀 RED IA WhatsApp Service v2.0 — porta ${PORT}`))
+app.listen(PORT, () => {
+    console.log(`🚀 RED IA WhatsApp Service v2.0 — porta ${PORT}`)
+    autoStartSavedSessions()
+})
