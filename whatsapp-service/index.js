@@ -190,13 +190,50 @@ async function analyzeImage(imageBuffer, caption, configs) {
 // ══════════════════════════════════════════════════
 // MÓDULO DE VOZ — TTS (Edge TTS — Microsoft, zero custo)
 // ══════════════════════════════════════════════════
+
+// Vozes disponíveis pt-BR no edge-tts (versão atual)
+const VALID_EDGE_VOICES_PTBR = [
+    'pt-BR-FranciscaNeural',
+    'pt-BR-AntonioNeural',
+    'pt-BR-ThalitaMultilingualNeural',
+]
+
+// Configurações de prosódia por voz para tom amigável/humanizado/descontraído
+const EDGE_VOICE_STYLE = {
+    'pt-BR-FranciscaNeural':           { rate: '-5%', pitch: '+2Hz' },
+    'pt-BR-AntonioNeural':             { rate: '-5%', pitch: '-1Hz' },
+    'pt-BR-ThalitaMultilingualNeural': { rate:  '0%', pitch: '+3Hz' },
+}
+
+/**
+ * Remove emojis e símbolos não-verbais do texto antes do TTS.
+ * Evita que a IA leia "Coração Vermelho", "Rosto Sorrindo", etc.
+ */
+function cleanTextForTTS(text) {
+    if (!text) return ''
+    let clean = text
+    // Remove emojis Unicode (range completo: emoticons, símbolos, transporte, misc)
+    clean = clean.replace(/[\u{1F000}-\u{1FFFF}\u{2600}-\u{27BF}\u{2300}-\u{23FF}\u{2B00}-\u{2BFF}\u{FE00}-\u{FE0F}\u{1FA00}-\u{1FAFF}]/gu, ' ')
+    // Remove variações de emoji e ZWJ sequences
+    clean = clean.replace(/[\uFE0F\u200D\u20E3]/g, '')
+    // Remove marcações WhatsApp (negrito, itálico, tachado, código)
+    clean = clean.replace(/[*_~`]/g, '')
+    // Colapsa espaços múltiplos
+    clean = clean.replace(/\s{2,}/g, ' ').trim()
+    // Limita tamanho (PTT ideal até ~500 chars)
+    return clean.substring(0, 500)
+}
+
 async function generateAudio(text, configs) {
     const ttsCfg = configs.tts || {}
     const ttsEnabled = ttsCfg.enabled === true || ttsCfg.enabled === 'true'
     if (!ttsEnabled) return null
 
-    const provider = ttsCfg.provider || 'edge' // Default para edge agora
-    const voiceId = ttsCfg.voice_id || 'pt-BR-FranciscaNeural'
+    const provider = ttsCfg.provider || 'edge'
+
+    // Limpa texto (remove emojis, markdown)
+    const cleanText = cleanTextForTTS(text)
+    if (!cleanText) return null
 
     try {
         const { execFile, exec } = require('child_process')
@@ -204,31 +241,38 @@ async function generateAudio(text, configs) {
         const execFileAsync = promisify(execFile)
         const execAsync = promisify(exec)
 
-        const tmpWav = path.join('/tmp', `tts_${Date.now()}.wav`)
         const tmpMp3 = path.join('/tmp', `tts_${Date.now()}.mp3`)
+        const tmpWav = path.join('/tmp', `tts_${Date.now()}.wav`)
         const tmpOgg = path.join('/tmp', `tts_${Date.now() + 1}.ogg`)
-
-        // Limpa markdown e caracteres de controle, limita tamanho
-        const cleanText = text
-            .replace(/[ --]/g, '')
-            .replace(/[*_~`]/g, '')
-            .substring(0, 500) // Edge aguenta mais que espeak
 
         let generated = false
 
-        // Tenta Edge-TTS primeiro se selecionado
+        // ── Edge-TTS ──
         if (provider === 'edge') {
+            // Valida voz — substitui vozes obsoletas por Francisca
+            let voiceId = ttsCfg.voice_id || 'pt-BR-FranciscaNeural'
+            if (!VALID_EDGE_VOICES_PTBR.includes(voiceId)) {
+                console.warn(`[TTS] Voz "${voiceId}" não existe mais, usando pt-BR-FranciscaNeural`)
+                voiceId = 'pt-BR-FranciscaNeural'
+            }
+
+            const voiceStyle = EDGE_VOICE_STYLE[voiceId] || { rate: '-5%', pitch: '+1Hz' }
+            const safeText = cleanText.replace(/"/g, '\\"')
+
             try {
-                console.log(`[TTS] Tentando Edge-TTS com voz ${voiceId}...`)
-                // edge-tts --voice pt-BR-FranciscaNeural --text "Texto" --write-media out.mp3
-                await execAsync(`edge-tts --voice "${voiceId}" --text "${cleanText.replace(/"/g, '\\"')}" --write-media "${tmpMp3}"`, { timeout: 20000 })
-                
+                console.log(`[TTS] Edge-TTS → ${voiceId} | rate:${voiceStyle.rate} pitch:${voiceStyle.pitch}`)
+
+                // Usa --rate e --pitch para tom humanizado e descontraído
+                await execAsync(
+                    `edge-tts --voice "${voiceId}" --rate "${voiceStyle.rate}" --pitch "${voiceStyle.pitch}" --text "${safeText}" --write-media "${tmpMp3}"`,
+                    { timeout: 25000 }
+                )
+
                 if (fs.existsSync(tmpMp3)) {
-                    // Converte MP3 -> OGG opus
                     await execFileAsync('ffmpeg', [
                         '-y', '-i', tmpMp3,
                         '-c:a', 'libopus',
-                        '-b:a', '24k',
+                        '-b:a', '32k',
                         '-vbr', 'on',
                         tmpOgg
                     ], { timeout: 15000 })
@@ -236,44 +280,40 @@ async function generateAudio(text, configs) {
                     generated = true
                 }
             } catch (err) {
-                console.error('[TTS] Falha no Edge-TTS, tentando fallback espeak-ng:', err.message)
+                console.error('[TTS] Edge-TTS falhou:', err.message)
+                // Fallback: retorna null → sendSmartResponse envia texto
+                return null
             }
         }
 
-        // Fallback ou se espeak for o selecionado
-        if (!generated) {
-            console.log(`[TTS] Usando espeak-ng...`)
-            await execFileAsync('espeak-ng', [
-                '-v', 'pt-br',
-                '-s', '155',   // velocidade
-                '-p', '60',    // pitch
-                '-a', '180',   // amplitude
-                '-w', tmpWav,
-                cleanText
-            ], { timeout: 15000 })
-
-            if (fs.existsSync(tmpWav)) {
-                await execFileAsync('ffmpeg', [
-                    '-y', '-i', tmpWav,
-                    '-c:a', 'libopus',
-                    '-b:a', '24k',
-                    '-vbr', 'on',
-                    tmpOgg
+        // ── espeak-ng — APENAS se selecionado explicitamente no dashboard ──
+        if (provider === 'espeak') {
+            console.log(`[TTS] espeak-ng (selecionado no dashboard)`)
+            try {
+                await execFileAsync('espeak-ng', [
+                    '-v', 'pt-br', '-s', '155', '-p', '60', '-a', '180',
+                    '-w', tmpWav, cleanText
                 ], { timeout: 15000 })
-                try { fs.unlinkSync(tmpWav) } catch (_) {}
-                generated = true
+
+                if (fs.existsSync(tmpWav)) {
+                    await execFileAsync('ffmpeg', ['-y', '-i', tmpWav, '-c:a', 'libopus', '-b:a', '24k', '-vbr', 'on', tmpOgg], { timeout: 15000 })
+                    try { fs.unlinkSync(tmpWav) } catch (_) {}
+                    generated = true
+                }
+            } catch (err) {
+                console.error('[TTS] espeak-ng falhou:', err.message)
+                return null
             }
         }
 
-        if (!fs.existsSync(tmpOgg)) {
-            console.error('[TTS] Falha ao gerar áudio final OGG')
+        if (!generated || !fs.existsSync(tmpOgg)) {
             return null
         }
 
         const audioBuffer = fs.readFileSync(tmpOgg)
         try { fs.unlinkSync(tmpOgg) } catch (_) {}
 
-        console.log(`[TTS] Áudio gerado (${audioBuffer.length} bytes) via ${generated && provider === 'edge' ? 'Edge-TTS' : 'espeak-ng'}`)
+        console.log(`[TTS] ✅ Áudio PTT gerado (${audioBuffer.length} bytes) via ${provider}`)
         return audioBuffer
     } catch (err) {
         console.error('[TTS] Exceção geral no módulo de voz:', err.message)
@@ -282,30 +322,60 @@ async function generateAudio(text, configs) {
 }
 // ══════════════════════════════════════════════════
 // DECIDE SE ENVIA TEXTO, ÁUDIO OU AMBOS
+// (com indicadores de presença: "digitando" / "gravando áudio")
 // ══════════════════════════════════════════════════
+
+/**
+ * Simula delay humano proporcional ao tamanho do texto.
+ * "Digitando" ~40 chars/s, "Gravando" 1-3s fixo.
+ */
+async function humanDelay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms))
+}
+
 async function sendSmartResponse(sock, remoteJid, text, quotedMsg, configs) {
     const ttsCfg = configs.tts || {}
     const ttsEnabled = ttsCfg.enabled === true || ttsCfg.enabled === 'true'
 
-    // Decide randomicamente ou por config se vai enviar áudio
+    // Decide se vai enviar áudio (randomicamente ou por config)
     const shouldSendAudio = ttsEnabled && Math.random() < (parseFloat(ttsCfg.audio_probability) || 0.3)
 
     if (shouldSendAudio && text.length < 500) {
-        // Tenta gerar áudio
-        const audioBuffer = await generateAudio(text, configs)
-        if (audioBuffer) {
-            // Envia PTT (Push-to-Talk = áudio de voz)
-            await sock.sendMessage(remoteJid, {
-                audio: audioBuffer,
-                mimetype: 'audio/ogg; codecs=opus',
-                ptt: true
-            }, { quoted: quotedMsg })
-            console.log(`[SEND] ✅ Áudio PTT enviado para ${remoteJid}`)
-            return
+        try {
+            // Mostra "gravando áudio..." antes de gerar
+            await sock.sendPresenceUpdate('recording', remoteJid)
+
+            const audioBuffer = await generateAudio(text, configs)
+
+            if (audioBuffer) {
+                // Pequeno delay natural após "gravação"
+                await humanDelay(800 + Math.random() * 1200)
+                await sock.sendPresenceUpdate('available', remoteJid)
+
+                await sock.sendMessage(remoteJid, {
+                    audio: audioBuffer,
+                    mimetype: 'audio/ogg; codecs=opus',
+                    ptt: true
+                }, { quoted: quotedMsg })
+                console.log(`[SEND] ✅ Áudio PTT enviado para ${remoteJid}`)
+                return
+            }
+            // Se geração de áudio falhou → cai para envio de texto abaixo
+            await sock.sendPresenceUpdate('available', remoteJid)
+        } catch (presErr) {
+            console.warn('[SEND] Erro ao atualizar presença:', presErr.message)
         }
     }
 
-    // Fallback: texto
+    // Envia texto com indicador "digitando..."
+    try {
+        await sock.sendPresenceUpdate('composing', remoteJid)
+        // Delay proporcional: ~35ms por caractere, mín 800ms, máx 4000ms
+        const typingMs = Math.min(4000, Math.max(800, text.length * 35))
+        await humanDelay(typingMs)
+        await sock.sendPresenceUpdate('available', remoteJid)
+    } catch (_) {}
+
     await sock.sendMessage(remoteJid, { text }, { quoted: quotedMsg })
 }
 
@@ -398,21 +468,26 @@ async function learnFromConversation(tenantId, conversationId, newMessages, aiCo
         const oldSummary = currentContext?.summary || 'Sem histórico anterior.'
         const transcript = newMessages.map(m => `${m.author} (${m.authorJid}): ${m.text}`).join('\n')
 
-        const prompt = `Você é um especialista em análise social e comportamento humano.
-RESUMO ATUAL: "${oldSummary}"
+        const chatPersonality = (aiConfigs.chat || {}).system_prompt || 'Você é um membro humano do grupo.'
+
+        const prompt = `Você é um especialista em análise social, comportamento humano e grupos de WhatsApp.
+
+PERSONALIDADE DA IA NO GRUPO: "${chatPersonality}"
+RESUMO ANTERIOR: "${oldSummary}"
 NOVAS MENSAGENS:
 ${transcript}
 
-Retorne APENAS um JSON puro (sem markdown) com:
-1. "summary": Novo resumo completo da conversa (inclua histórico + novo).
-2. "vibe": Humor atual (ex: "Zoeira total", "Discussão acalorada", "Clima pesado", "Animado").
-3. "group_type": Tipo (ex: "Família", "Amigos próximos", "Trabalho", "Negócios", "Galera").
-4. "daily_topics": Principais tópicos do momento.
-5. "style": Gírias, memes, termos usados (ex: "bicho, vixe, macho, eita").
+Analise e retorne APENAS um JSON puro (sem markdown) com:
+1. "summary": Resumo completo e atualizado (histórico + novidades).
+2. "vibe": Humor atual (ex: "Zoeira total", "Discussão acalorada", "Animado", "Cotidiano tranquilo").
+3. "group_type": Tipo do grupo (ex: "Família", "Amigos", "Trabalho", "Galera do rolê").
+4. "daily_topics": Tópicos principais agora.
+5. "style": Gírias e expressões usadas no grupo (ex: "bicho, vixe, macho, eita, oxe").
 6. "profiles": Array de { "jid": "...", "name": "...", "nicknames": [], "personality": "...", "style_note": "..." }
-7. "proactive_thought": Uma fala CURTA e espontânea da IA (só se algo for MUITO engraçado, polêmico ou pedir opinião). Deixe vazio na maioria dos casos.
-8. "proactive_urgency": número 0-10 de urgência para a IA participar agora (0 = deixa rolar, 10 = imperdível).
-9. "context_for_next_response": Frase curta do que a IA deve SABER para responder bem a próxima.
+7. "proactive_thought": Fala CURTA e NATURAL da IA para entrar na conversa AGORA como um humano do grupo faria. Use gírias do "style". Preencha quando: algo engraçado aconteceu, discussão polêmica, pergunta aberta, assunto que a IA domina, celebração. NUNCA use saudações formais. Máximo 2-3 frases. Deixe VAZIO se a conversa for trivial ou não houver ganho em participar.
+8. "proactive_urgency": Número 0-10 de urgência para participar agora (0=deixa rolar, 7+=vale entrar, 10=imperdível).
+9. "proactive_trigger": Gatilho identificado (ex: "pergunta aberta", "piada", "polêmica", "celebração"). Vazio se nenhum.
+10. "context_for_next_response": Uma frase do que a IA precisa saber para responder bem quando for chamada.
 
 Retorne APENAS o JSON puro.`
 
@@ -471,31 +546,56 @@ Retorne APENAS o JSON puro.`
             }
         }
 
-        // Intervenção proativa inteligente
+        // ── Intervenção Proativa Inteligente ──
         const urgency = parseFloat(result.proactive_urgency) || 0
-        const lastProactive = lastProactiveTime.get(`${tenantId}_${conversationId}`) || 0
+        const trigger = result.proactive_trigger || ''
+        const proactiveThought = (result.proactive_thought || '').trim()
+
+        const lastProactiveKey = `${tenantId}_${conversationId}`
+        const lastProactive = lastProactiveTime.get(lastProactiveKey) || 0
         const timeSinceLastProactive = Date.now() - lastProactive
+
         const proactiveCfg = aiConfigs.proactive || {}
         const proactiveEnabled = proactiveCfg.enabled !== false && proactiveCfg.enabled !== 'false'
+        const frequency = parseFloat(proactiveCfg.frequency || 0.15)
 
-        // Dispara se: urgência alta (>7) OU chance aleatória baseada no proactive_frequency
-        const frequency = parseFloat(proactiveCfg.frequency || currentContext?.proactive_frequency || 0.12)
-        const shouldParticipate = proactiveEnabled &&
-            timeSinceLastProactive > PROACTIVE_COOLDOWN_MS &&
-            result.proactive_thought?.length > 5 &&
-            (urgency >= 7 || Math.random() < frequency)
+        // Cooldown adaptativo: quanto maior a urgência, menor o cooldown mínimo
+        // urgency 10 → 10s cooldown; urgency 5 → 30s; urgency 0 → 45s
+        const adaptiveCooldown = urgency >= 9 ? 10000
+            : urgency >= 7 ? 20000
+            : urgency >= 5 ? 30000
+            : PROACTIVE_COOLDOWN_MS
+
+        // Critérios de disparo:
+        // 1. Urgência MUITO alta (≥9): quase sempre dispara
+        // 2. Urgência alta (≥7) + cooldown OK: dispara
+        // 3. Urgência média (≥5) + chance aleatória: pode disparar
+        // 4. Qualquer urgência + chance baseada na frequência configurada: dispara às vezes
+        const randomRoll = Math.random()
+        const shouldParticipate = proactiveEnabled
+            && proactiveThought.length > 5
+            && timeSinceLastProactive > adaptiveCooldown
+            && (
+                urgency >= 9
+                || (urgency >= 7 && randomRoll < 0.85)
+                || (urgency >= 5 && randomRoll < frequency * 2)
+                || randomRoll < frequency
+            )
 
         if (shouldParticipate) {
             const session = sessions.get(tenantId)
             if (session?.sock && session.status === 'authenticated') {
-                console.log(`[PROATIVO] 🤖 Urgência ${urgency} — "${result.proactive_thought}"`)
-                lastProactiveTime.set(`${tenantId}_${conversationId}`, Date.now())
+                console.log(`[PROATIVO] 🤖 Urgência ${urgency} | Trigger: "${trigger}" | "${proactiveThought.substring(0, 60)}"`)
+                lastProactiveTime.set(lastProactiveKey, Date.now())
 
-                // Delay natural (2-8 segundos)
-                const delay = 2000 + Math.random() * 6000
+                // Delay humano: urgência alta → responde rápido, baixa → demora mais
+                const minDelay = urgency >= 8 ? 1500 : urgency >= 5 ? 3000 : 5000
+                const maxDelay = urgency >= 8 ? 4000 : urgency >= 5 ? 8000 : 15000
+                const delay = minDelay + Math.random() * (maxDelay - minDelay)
+
                 setTimeout(async () => {
                     try {
-                        await sendSmartResponse(session.sock, conversationId, result.proactive_thought, null, aiConfigs)
+                        await sendSmartResponse(session.sock, conversationId, proactiveThought, null, aiConfigs)
                     } catch (e) {
                         console.error('[PROATIVO] Erro ao enviar:', e.message)
                     }
@@ -552,7 +652,7 @@ async function loadTenantAIConfigs(tenantId) {
                     provider: configs.tts_provider || 'edge',
                     api_key: configs.tts_api_key || '',
                     model: configs.tts_model || '',
-                    voice_id: configs.tts_voice_id || 'pt-BR-CamilaNeural',
+                    voice_id: configs.tts_voice_id || 'pt-BR-FranciscaNeural',
                     enabled: configs.tts_enabled === 'true',
                     audio_probability: parseFloat(configs.tts_audio_probability) || 0.3
                 },
