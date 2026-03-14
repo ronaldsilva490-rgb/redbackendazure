@@ -673,7 +673,8 @@ Regras para "trigger": o que motivou (ex: "pergunta aberta", "piada", "polêmica
         const effectiveFreq     = isActiveGroup ? Math.min(frequency * 3, 0.85) : frequency
 
         // Cooldown adaptativo por urgência
-        const adaptiveCooldown = urgency >= 9 ? 8000 : urgency >= 7 ? 15000 : urgency >= 5 ? 25000 : PROACTIVE_COOLDOWN_MS
+        const cooldownMs      = getCfg(configs, 'proactive_cooldown_ms', DEFAULT_PROACTIVE_COOLDOWN)
+        const adaptiveCooldown = urgency >= 9 ? 8000 : urgency >= 7 ? 15000 : urgency >= 5 ? 25000 : cooldownMs
 
         const roll = Math.random()
         const shouldParticipate = proactiveEnabled
