@@ -499,7 +499,7 @@ async function getContactMemory(tenantId, contactJid, limit = 10) {
 // ══════════════════════════════════════════════════
 async function learnFromConversation(tenantId, conversationId, newMessages, aiConfigs, isActiveGroup = false) {
     const chatCfg = aiConfigs.chat || {}
-    const apiKey = chatCfg.api_key || aiConfigs.api_key || ''
+    const apiKey  = chatCfg.api_key || aiConfigs.api_key || ''
     if (!apiKey) return
 
     console.log(`[LEARN] 🧠 ${conversationId} (ativo: ${isActiveGroup})`)
@@ -512,173 +512,190 @@ async function learnFromConversation(tenantId, conversationId, newMessages, aiCo
             .eq('conversation_id', conversationId)
             .single()
 
-        const oldSummary = currentContext?.summary || 'Sem histórico anterior.'
-        const transcript = newMessages.map(m => `${m.author}: ${m.text}`).join('\n')
-        const chatPersonality = chatCfg.system_prompt || 'Você é um membro humano do grupo.'
-
-        const proactiveInstruction = isActiveGroup
-            ? `O grupo está MOVIMENTADO agora. A IA DEVE ter algo a dizer se o assunto for minimamente interessante. Seja mais ousada em participar.`
-            : `Só entre na conversa se houver algo genuinamente interessante. Prefira silêncio a interrupções sem valor.`
-
-        const prompt = `Você é um especialista em análise social e comportamento humano em grupos de WhatsApp.
-
-PERSONALIDADE DA IA: "${chatPersonality}"
-RESUMO ANTERIOR: "${oldSummary}"
-NOVAS MENSAGENS:
-${transcript}
-
-${proactiveInstruction}
-
-Retorne APENAS JSON puro com:
-1. "summary": Resumo completo atualizado.
-2. "vibe": Humor atual em pt-BR (ex: "Zoeira total", "Animado", "Cotidiano").
-3. "group_type": Tipo do grupo.
-4. "daily_topics": Tópicos do momento.
-5. "style": Gírias e expressões usadas.
-6. "profiles": [{ "jid", "name", "nicknames": [], "personality", "style_note", "memory_facts": [] }]
-   — memory_facts: fatos IMPORTANTES sobre a pessoa para lembrar a longo prazo (viagem, relacionamento, trabalho, problema de saúde, etc). Deixe vazio se nada relevante.
-7. "proactive_thought": Fala CURTA e NATURAL da IA como humano do grupo. Use gírias do "style". Máx 2 frases. Vazio se nada relevante.
-8. "proactive_urgency": 0-10. 0=silêncio, 6+=vale participar, 9+=imperdível.
-9. "proactive_trigger": Gatilho ("pergunta aberta", "piada", "polêmica", "celebração", "alguém mencionou a IA indiretamente"). Vazio se nenhum.
-10. "proactive_reaction_mood": Mood para sticker/reação opcional ("happy","love","laugh","wow","none").
-11. "intent": Intenção detectada na última mensagem ("pergunta_preco", "pergunta_horario", "elogio", "reclamacao", "conversa", "pedido_ajuda", "outro").
-12. "handoff_needed": true se a conversa exige atenção humana (reclamação séria, pergunta técnica impossível, pedido urgente fora do escopo).
-13. "context_for_next_response": Frase curta do que a IA precisa saber para a próxima resposta.
-
-Retorne APENAS o JSON puro.`
+        const oldSummary   = currentContext?.summary || 'Sem histórico.'
+        const transcript   = newMessages.map(m => `${m.author}: ${m.text}`).join('\n')
+        const personality  = chatCfg.system_prompt || 'Você é um membro humano do grupo.'
+        const activeHint   = isActiveGroup
+            ? 'GRUPO ATIVO: participe se o assunto for interessante, seja ousada.'
+            : 'Só participe se houver algo genuinamente relevante.'
 
         const proactiveCfgForAI = aiConfigs.proactive || {}
-        const learningChatCfg = (proactiveCfgForAI.provider && proactiveCfgForAI.api_key && proactiveCfgForAI.model)
-            ? { provider: proactiveCfgForAI.provider, api_key: proactiveCfgForAI.api_key, model: proactiveCfgForAI.model, system_prompt: chatCfg.system_prompt }
+        const baseChatCfg = (proactiveCfgForAI.provider && proactiveCfgForAI.api_key && proactiveCfgForAI.model)
+            ? { provider: proactiveCfgForAI.provider, api_key: proactiveCfgForAI.api_key, model: proactiveCfgForAI.model, system_prompt: personality }
             : { ...chatCfg }
-        const analysisCfg = { ...aiConfigs, chat: learningChatCfg }
-        const aiResponse = await getAIResponse(prompt, analysisCfg, 'Analista de comportamento. Responda apenas com JSON puro.')
+        const analysisCfg = { ...aiConfigs, chat: baseChatCfg }
 
-        if (!aiResponse) return
+        // ── CHAMADA 1: Contexto + perfis (JSON menor, mais estável) ──
+        const contextPrompt = `Analise esta conversa de WhatsApp e retorne APENAS JSON puro.
 
-        const clean = aiResponse.replace(/```json|```/g, '').trim()
-        const result = JSON.parse(clean)
+RESUMO ANTERIOR: "${oldSummary}"
+MENSAGENS:
+${transcript}
 
-        // Salva contexto
-        await supabase.from('whatsapp_conversation_contexts').upsert({
-            tenant_id: tenantId,
-            conversation_id: conversationId,
-            summary: result.summary || oldSummary,
-            vibe: result.vibe || 'Neutro',
-            group_type: result.group_type || 'Geral',
-            daily_topics: result.daily_topics || '',
-            communication_style: result.style || '',
-            context_hint: result.context_for_next_response || '',
-            updated_at: new Date()
-        }, { onConflict: 'tenant_id, conversation_id' })
+JSON com exatamente estas chaves:
+{"summary":"resumo curto","vibe":"humor atual","group_type":"tipo","daily_topics":"topicos","style":"girias","profiles":[{"jid":"...","name":"...","nicknames":[],"memory_facts":[]}],"intent":"conversa","handoff_needed":false,"context_hint":"dica curta"}`
 
-        // Atualiza perfis + salva memória de longo prazo
-        if (result.profiles?.length) {
-            for (const p of result.profiles) {
-                if (!p.jid) continue
-                const { data: existing } = await supabase
-                    .from('whatsapp_contact_profiles')
-                    .select('metadata')
-                    .eq('tenant_id', tenantId)
-                    .eq('contact_id', p.jid)
-                    .single()
+        const ctxResponse = await getAIResponse(contextPrompt, analysisCfg, 'Responda APENAS com JSON puro. Sem texto antes ou depois.')
+        let ctxResult = null
+        if (ctxResponse) {
+            try {
+                const j = ctxResponse.replace(/```json\s*/gi, '').replace(/```/g, '').trim()
+                const s = j.substring(j.indexOf('{'), j.lastIndexOf('}') + 1)
+                ctxResult = JSON.parse(s)
+            } catch (e) {
+                console.warn('[LEARN] Parse contexto falhou:', e.message)
+            }
+        }
 
-                let meta = existing?.metadata || {}
-                if (!meta.nicknames) meta.nicknames = []
-                if (p.nicknames) p.nicknames.forEach(n => { if (n && !meta.nicknames.includes(n)) meta.nicknames.push(n) })
+        // ── CHAMADA 2: Decisão proativa (JSON mínimo, 3 campos apenas) ──
+        const proactivePrompt = `Você é a IA com esta personalidade: "${personality}"
+${activeHint}
 
-                await supabase.from('whatsapp_contact_profiles').upsert({
-                    tenant_id: tenantId,
-                    contact_id: p.jid,
-                    full_name: p.name || null,
-                    nickname: meta.nicknames[0] || null,
-                    personality_traits: p.personality || null,
-                    communication_style: p.style_note || null,
-                    metadata: meta,
-                    updated_at: new Date()
-                }, { onConflict: 'tenant_id, contact_id' })
+CONVERSA:
+${transcript}
 
-                // Salva fatos de memória longa
-                if (p.memory_facts?.length) {
-                    for (const fact of p.memory_facts) {
-                        if (fact && fact.length > 5) {
-                            await saveMemoryFact(tenantId, p.jid, fact)
+Decida se deve enviar uma mensagem espontânea AGORA.
+Retorne APENAS este JSON (sem texto extra, sem markdown):
+{"thought":"mensagem curta natural se quiser participar, vazio se não","urgency":0,"trigger":""}
+
+Regras para "thought":
+- Máximo 2 frases curtas, linguagem natural do grupo
+- Use as gírias que aparecem na conversa
+- NUNCA comece com "Olá" ou saudações formais
+- Deixe VAZIO se não houver nada genuíno a dizer
+Regras para "urgency": número 0-10 (0=silêncio, 7+=vale participar, 10=imperdível)
+Regras para "trigger": o que motivou (ex: "pergunta aberta", "piada", "polêmica") ou vazio`
+
+        const proactiveResponse = await getAIResponse(proactivePrompt, analysisCfg, 'Responda APENAS com JSON puro de 3 campos.')
+        let proResult = { thought: '', urgency: 0, trigger: '' }
+        if (proactiveResponse) {
+            try {
+                const j = proactiveResponse.replace(/```json\s*/gi, '').replace(/```/g, '').trim()
+                const s = j.substring(j.indexOf('{'), j.lastIndexOf('}') + 1)
+                const parsed = JSON.parse(s)
+                proResult = {
+                    thought:  (parsed.thought  || parsed.proactive_thought  || '').trim(),
+                    urgency:  parseFloat(parsed.urgency  || parsed.proactive_urgency  || 0),
+                    trigger:  parsed.trigger   || parsed.proactive_trigger  || '',
+                }
+            } catch (e) {
+                console.warn('[LEARN] Parse proativo falhou:', e.message)
+                // Recuperação por regex mesmo
+                const mThought = proactiveResponse.match(/"thought"\s*:\s*"((?:[^"\\]|\\.)*)"/)?.[1] || ''
+                const mUrgency = proactiveResponse.match(/"urgency"\s*:\s*([0-9.]+)/)?.[1] || '0'
+                proResult = { thought: mThought.trim(), urgency: parseFloat(mUrgency), trigger: '' }
+            }
+        }
+
+        console.log(`[LEARN] ✅ vibe:${ctxResult?.vibe || '?'} | urgency:${proResult.urgency} | thought:"${proResult.thought?.substring(0,50)}"`)
+
+        // ── Salva contexto ──
+        if (ctxResult) {
+            await supabase.from('whatsapp_conversation_contexts').upsert({
+                tenant_id: tenantId,
+                conversation_id: conversationId,
+                summary: ctxResult.summary || oldSummary,
+                vibe: ctxResult.vibe || 'Neutro',
+                group_type: ctxResult.group_type || 'Geral',
+                daily_topics: ctxResult.daily_topics || '',
+                communication_style: ctxResult.style || '',
+                context_hint: ctxResult.context_hint || '',
+                updated_at: new Date()
+            }, { onConflict: 'tenant_id, conversation_id' })
+
+            // Atualiza perfis + memória longa
+            if (ctxResult.profiles?.length) {
+                for (const p of ctxResult.profiles) {
+                    if (!p.jid) continue
+                    const { data: existing } = await supabase
+                        .from('whatsapp_contact_profiles')
+                        .select('metadata')
+                        .eq('tenant_id', tenantId)
+                        .eq('contact_id', p.jid)
+                        .single()
+
+                    let meta = existing?.metadata || {}
+                    if (!meta.nicknames) meta.nicknames = []
+                    if (p.nicknames) p.nicknames.forEach(n => { if (n && !meta.nicknames.includes(n)) meta.nicknames.push(n) })
+
+                    await supabase.from('whatsapp_contact_profiles').upsert({
+                        tenant_id: tenantId,
+                        contact_id: p.jid,
+                        full_name: p.name || null,
+                        nickname: meta.nicknames[0] || null,
+                        metadata: meta,
+                        updated_at: new Date()
+                    }, { onConflict: 'tenant_id, contact_id' })
+
+                    if (p.memory_facts?.length) {
+                        for (const fact of p.memory_facts) {
+                            if (fact?.length > 5) await saveMemoryFact(tenantId, p.jid, fact)
                         }
                     }
                 }
             }
+
+            // Handoff
+            if (ctxResult.handoff_needed) {
+                try {
+                    await supabase.from('whatsapp_handoff_queue').upsert({
+                        tenant_id: tenantId, conversation_id: conversationId,
+                        reason: ctxResult.intent || 'Detectado pela IA', status: 'pending', created_at: new Date()
+                    }, { onConflict: 'tenant_id, conversation_id' })
+                } catch (_) {}
+            }
         }
 
-        // Handoff humano
-        if (result.handoff_needed) {
-            console.log(`[HANDOFF] ⚠️ Atenção humana necessária em ${conversationId}`)
-            try {
-                await supabase.from('whatsapp_handoff_queue').upsert({
-                    tenant_id: tenantId,
-                    conversation_id: conversationId,
-                    reason: result.intent || 'Detectado pela IA',
-                    status: 'pending',
-                    created_at: new Date()
-                }, { onConflict: 'tenant_id, conversation_id' })
-            } catch (_) {}
-        }
+        // ── Disparo proativo ──
+        const proactiveThought = proResult.thought
+        const urgency          = proResult.urgency
+        const trigger          = proResult.trigger
 
-        // ── Intervenção Proativa ──
-        const urgency = parseFloat(result.proactive_urgency) || 0
-        const proactiveThought = (result.proactive_thought || '').trim()
-        const trigger = result.proactive_trigger || ''
-        const reactionMood = result.proactive_reaction_mood || 'none'
-
-        const lastProactiveKey = `${tenantId}_${conversationId}`
+        const lastProactiveKey     = `${tenantId}_${conversationId}`
         const timeSinceLastProactive = Date.now() - (lastProactiveTime.get(lastProactiveKey) || 0)
 
-        const proactiveCfg = aiConfigs.proactive || {}
-        const proactiveEnabled = proactiveCfg.enabled !== false && proactiveCfg.enabled !== 'false'
-        const frequency = parseFloat(proactiveCfg.frequency || 0.15)
+        const proactiveCfg      = aiConfigs.proactive || {}
+        const proactiveEnabled  = proactiveCfg.enabled !== false && proactiveCfg.enabled !== 'false'
+        const frequency         = parseFloat(proactiveCfg.frequency || 0.15)
+        const effectiveFreq     = isActiveGroup ? Math.min(frequency * 3, 0.85) : frequency
 
-        // Cooldown adaptativo
-        const adaptiveCooldown = urgency >= 9 ? 8000 : urgency >= 7 ? 18000 : urgency >= 5 ? 28000 : PROACTIVE_COOLDOWN_MS
+        // Cooldown adaptativo por urgência
+        const adaptiveCooldown = urgency >= 9 ? 8000 : urgency >= 7 ? 15000 : urgency >= 5 ? 25000 : PROACTIVE_COOLDOWN_MS
 
-        // Boost de frequência se grupo ativo
-        const effectiveFrequency = isActiveGroup ? Math.min(frequency * 2.5, 0.7) : frequency
-
-        const randomRoll = Math.random()
+        const roll = Math.random()
         const shouldParticipate = proactiveEnabled
             && proactiveThought.length > 3
             && timeSinceLastProactive > adaptiveCooldown
             && (
                 urgency >= 9
-                || (urgency >= 7 && randomRoll < 0.88)
-                || (urgency >= 5 && randomRoll < effectiveFrequency * 1.5)
-                || randomRoll < effectiveFrequency
+                || (urgency >= 7 && roll < 0.90)
+                || (urgency >= 5 && roll < effectiveFreq * 2)
+                || (urgency >= 3 && roll < effectiveFreq)
+                || (isActiveGroup  && roll < effectiveFreq * 0.5)
             )
+
+        console.log(`[PROATIVO] urgency:${urgency} roll:${roll.toFixed(2)} freq:${effectiveFreq.toFixed(2)} ativo:${isActiveGroup} enabled:${proactiveEnabled} thought:"${proactiveThought?.substring(0,40)}" cooldownOK:${timeSinceLastProactive > adaptiveCooldown} → ${shouldParticipate ? '✅ VAI' : '❌ não'}`)
 
         if (shouldParticipate) {
             const session = sessions.get(tenantId)
             if (session?.sock && session.status === 'authenticated') {
-                console.log(`[PROATIVO] 🤖 urgência:${urgency} trigger:"${trigger}" ativo:${isActiveGroup}`)
                 lastProactiveTime.set(lastProactiveKey, Date.now())
 
-                const minDelay = urgency >= 8 ? 1200 : urgency >= 5 ? 2500 : 4000
-                const maxDelay = urgency >= 8 ? 3500 : urgency >= 5 ? 7000 : 14000
-                const delay = minDelay + Math.random() * (maxDelay - minDelay)
+                const minDelay = urgency >= 8 ? 1000 : urgency >= 5 ? 2000 : 3500
+                const maxDelay = urgency >= 8 ? 3000 : urgency >= 5 ? 6000 : 12000
+                const delay    = minDelay + Math.random() * (maxDelay - minDelay)
 
                 setTimeout(async () => {
                     try {
-                        // Às vezes envia sticker antes de falar
-                        if (reactionMood !== 'none' && Math.random() < 0.25) {
-                            await sendSticker(session.sock, conversationId, reactionMood)
-                            await humanDelay(800 + Math.random() * 1200)
-                        }
                         await sendSmartResponse(session.sock, conversationId, proactiveThought, null, aiConfigs)
+                        console.log(`[PROATIVO] ✅ Enviado: "${proactiveThought?.substring(0,60)}"`)
                     } catch (e) {
-                        console.error('[PROATIVO] Erro:', e.message)
+                        console.error('[PROATIVO] Erro ao enviar:', e.message)
                     }
                 }, delay)
             }
         }
 
-        console.log(`[LEARN] ✅ ${conversationId} | Vibe: ${result.vibe} | Intent: ${result.intent}`)
     } catch (err) {
         console.error(`[LEARN] ❌ Erro:`, err.message)
     }
