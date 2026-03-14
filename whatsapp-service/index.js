@@ -704,8 +704,21 @@ Regras para "trigger": o que motivou (ex: "pergunta aberta", "piada", "polêmica
 
                 setTimeout(async () => {
                     try {
-                        await sendSmartResponse(session.sock, conversationId, proactiveThought, null, aiConfigs)
-                        console.log(`[PROATIVO] ✅ Enviado: "${proactiveThought?.substring(0,60)}"`)
+                        // proactiveThought é instrução interna do LEARN — não vai direto pro WhatsApp
+                        // Passa pela IA de chat para gerar a mensagem final humanizada
+                        const chatPersonalityPrompt = (aiConfigs.chat || {}).system_prompt || 'Você é um membro humano do grupo.'
+                        const chatPrompt = `${chatPersonalityPrompt}
+[VOCÊ VAI PARTICIPAR ESPONTANEAMENTE DA CONVERSA]
+[INTENÇÃO: ${proactiveThought}]
+[ESTILO: natural, use gírias do grupo se houver, máx 2 frases, NUNCA comece com saudação formal, NUNCA mencione que é IA]
+
+Escreva SUA FALA para entrar na conversa agora:`
+
+                        const finalMsg = await getAIResponse(chatPrompt, aiConfigs)
+                        if (finalMsg && finalMsg.trim().length > 2) {
+                            await sendSmartResponse(session.sock, conversationId, finalMsg.trim(), null, aiConfigs)
+                            console.log(`[PROATIVO] ✅ Enviado: "${finalMsg.trim().substring(0,60)}"`)
+                        }
                     } catch (e) {
                         console.error('[PROATIVO] Erro ao enviar:', e.message)
                     }
@@ -745,39 +758,43 @@ async function realtimeProactiveAnalysis(tenantId, conversationId, messageText, 
         : 'So participe se for algo realmente relevante.'
     const frequency   = parseFloat(proactiveCfg.frequency || 0.15)
 
-    const prompt = `Voce e: "${personality}"
-${activeHint}
+    // ── PASSO 1: Análise interna — decide SE e SOBRE O QUÊ participar ──
+    const analysisPrompt = `${activeHint}
 
 ${author} disse: "${messageText}"
 
-Analise APENAS esta mensagem e decida se vale participar AGORA.
-Retorne SOMENTE este JSON (sem texto, sem markdown):
-{"thought":"sua fala natural aqui ou vazio","urgency":0,"trigger":""}
+Analise esta mensagem e retorne SOMENTE este JSON (sem markdown):
+{"should_reply":false,"urgency":0,"topic":"","angle":"","trigger":""}
 
-- thought: max 2 frases naturais. Vazio se nao ha nada genuino.
-- urgency: 0-10 (0=silencio, 5+=considerar, 8+=quase sempre, 10=imperdivel)
+- should_reply: true se vale participar, false se nao
+- urgency: 0-10
+- topic: tema da mensagem em poucas palavras (ex: "risada sem contexto", "pergunta sobre Matrix")
+- angle: como a IA deve abordar (ex: "entrar na brincadeira", "dar opiniao direta", "fazer uma pergunta de volta")
 - trigger: "pergunta","piada","polemica","nome_mencionado","celebracao" ou vazio`
 
     try {
-        const response = await getAIResponse(prompt, configs, 'Responda APENAS com JSON de 3 campos.')
-        if (!response) return
+        const analysisResponse = await getAIResponse(analysisPrompt, configs, 'Analista interno. Responda APENAS com JSON de 5 campos.')
+        if (!analysisResponse) return
 
-        const j = response.replace(/```json\s*/gi, '').replace(/```/g, '').trim()
+        const j = analysisResponse.replace(/```json\s*/gi, '').replace(/```/g, '').trim()
         const s = j.substring(j.indexOf('{'), j.lastIndexOf('}') + 1)
-        let parsed
+        let analysis
         try {
-            parsed = JSON.parse(s)
+            analysis = JSON.parse(s)
         } catch (_) {
-            const mT = response.match(/"thought"\s*:\s*"((?:[^"\\]|\\.)*)"/)?.[1] || ''
-            const mU = response.match(/"urgency"\s*:\s*([0-9.]+)/)?.[1] || '0'
-            parsed = { thought: mT.trim(), urgency: parseFloat(mU), trigger: '' }
+            const mR = analysisResponse.match(/"should_reply"\s*:\s*(true|false)/)?.[1]
+            const mU = analysisResponse.match(/"urgency"\s*:\s*([0-9.]+)/)?.[1] || '0'
+            const mT = analysisResponse.match(/"topic"\s*:\s*"((?:[^"\\]|\\.)*)"/)?.[1] || ''
+            const mA = analysisResponse.match(/"angle"\s*:\s*"((?:[^"\\]|\\.)*)"/)?.[1] || ''
+            analysis = { should_reply: mR === 'true', urgency: parseFloat(mU), topic: mT, angle: mA, trigger: '' }
         }
 
-        const thought = (parsed.thought || '').trim()
-        const urgency = parseFloat(parsed.urgency || 0)
-        const trigger = parsed.trigger || ''
+        const urgency  = parseFloat(analysis.urgency || 0)
+        const topic    = (analysis.topic  || '').trim()
+        const angle    = (analysis.angle  || '').trim()
+        const trigger  = analysis.trigger || ''
 
-        if (!thought || thought.length < 3) return
+        if (!analysis.should_reply || urgency < 1) return
 
         const urgencyThresh = isActiveGroup
             ? getCfg(configs, 'realtime_urgency_active', 5)
@@ -793,22 +810,52 @@ Retorne SOMENTE este JSON (sem texto, sem markdown):
             || roll < effectiveFreq
         )
 
-        console.log(`[RT] ${author} | urgency:${urgency} roll:${roll.toFixed(2)} thresh:${urgencyThresh} ativo:${isActiveGroup} -> ${shouldFire ? 'VAI' : 'nao'} "${thought?.substring(0,40)}"`)
+        console.log(`[RT] ${author} | urgency:${urgency} roll:${roll.toFixed(2)} thresh:${urgencyThresh} ativo:${isActiveGroup} topic:"${topic}" angle:"${angle}" -> ${shouldFire ? 'VAI' : 'nao'}`)
 
-        if (shouldFire && sock) {
-            lastProactiveTime.set(proKey, Date.now())
-            const minDelay = urgency >= 8 ? 800  : urgency >= 5 ? 1500 : 3000
-            const maxDelay = urgency >= 8 ? 2500 : urgency >= 5 ? 5000 : 10000
-            const delay    = minDelay + Math.random() * (maxDelay - minDelay)
-            setTimeout(async () => {
+        if (!shouldFire || !sock) return
+
+        // ── PASSO 2: Gera a mensagem FINAL com a IA de chat ──
+        // O "thought" do passo 1 é instrução interna — nunca vai direto pro WhatsApp
+        lastProactiveTime.set(proKey, Date.now())
+
+        const minDelay = urgency >= 8 ? 800  : urgency >= 5 ? 1500 : 3000
+        const maxDelay = urgency >= 8 ? 2500 : urgency >= 5 ? 5000 : 10000
+        const delay    = minDelay + Math.random() * (maxDelay - minDelay)
+
+        setTimeout(async () => {
+            try {
+                // Busca contexto da conversa para enriquecer a resposta
+                let convContext = ''
                 try {
-                    await sendSmartResponse(sock, conversationId, thought, null, configs)
-                    console.log(`[RT] Enviado: "${thought?.substring(0,60)}"`)
-                } catch (e) {
-                    console.error('[RT] Erro ao enviar:', e.message)
+                    const { data: ctx } = await supabase
+                        .from('whatsapp_conversation_contexts')
+                        .select('vibe, style, context_hint')
+                        .eq('tenant_id', tenantId)
+                        .eq('conversation_id', conversationId)
+                        .single()
+                    if (ctx?.vibe)        convContext += `\n[VIBE DO GRUPO: ${ctx.vibe}]`
+                    if (ctx?.style)       convContext += `\n[GÍRIAS DO GRUPO: ${ctx.style}]`
+                    if (ctx?.context_hint) convContext += `\n[CONTEXTO: ${ctx.context_hint}]`
+                } catch (_) {}
+
+                const chatPrompt = `${personality}${convContext}
+[VOCÊ VAI PARTICIPAR ESPONTANEAMENTE DA CONVERSA]
+[TEMA: ${topic}]
+[ABORDAGEM: ${angle}]
+[${author} disse: "${messageText}"]
+[ESTILO: seja natural, use as gírias do grupo se houver, máx 2 frases, NUNCA comece com saudação formal, NUNCA mencione que é IA]
+
+Escreva SUA FALA para entrar na conversa agora:`
+
+                const finalMsg = await getAIResponse(chatPrompt, configs)
+                if (finalMsg && finalMsg.trim().length > 2) {
+                    await sendSmartResponse(sock, conversationId, finalMsg.trim(), null, configs)
+                    console.log(`[RT] ✅ Enviado: "${finalMsg.trim().substring(0,60)}"`)
                 }
-            }, delay)
-        }
+            } catch (e) {
+                console.error('[RT] Erro ao gerar/enviar:', e.message)
+            }
+        }, delay)
     } catch (err) {
         console.error('[RT] Excecao:', err.message)
     }
