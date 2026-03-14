@@ -42,12 +42,15 @@ const DEFAULT_REALTIME_COOLDOWN   = 8000   // ms mínimo entre análises realtim
 const DEFAULT_ACTIVITY_WINDOW_MS  = 120000 // janela pra medir grupo ativo
 const DEFAULT_ACTIVE_THRESH       = 4      // msgs na janela = grupo ativo
 
-/** Lê config dinâmica com fallback pro default */
+/** Lê config dinâmica com fallback pro default — null-safe */
 function getCfg(configs, key, defaultVal) {
-    const val = configs?.proactive?.[key] ?? configs?.[key]
-    if (val === undefined || val === null || val === '') return defaultVal
-    const n = parseFloat(val)
-    return isNaN(n) ? defaultVal : n
+    try {
+        if (!configs) return defaultVal
+        const val = configs?.proactive?.[key] ?? configs?.[key]
+        if (val === undefined || val === null || val === '') return defaultVal
+        const n = parseFloat(val)
+        return isNaN(n) ? defaultVal : n
+    } catch (_) { return defaultVal }
 }
 
 // ── Sticker pack (WebP base64 paths em disco) ──
@@ -673,7 +676,7 @@ Regras para "trigger": o que motivou (ex: "pergunta aberta", "piada", "polêmica
         const effectiveFreq     = isActiveGroup ? Math.min(frequency * 3, 0.85) : frequency
 
         // Cooldown adaptativo por urgência
-        const cooldownMs      = getCfg(configs, 'proactive_cooldown_ms', DEFAULT_PROACTIVE_COOLDOWN)
+        const cooldownMs      = getCfg(aiConfigs, 'proactive_cooldown_ms', DEFAULT_PROACTIVE_COOLDOWN)
         const adaptiveCooldown = urgency >= 9 ? 8000 : urgency >= 7 ? 15000 : urgency >= 5 ? 25000 : cooldownMs
 
         const roll = Math.random()
