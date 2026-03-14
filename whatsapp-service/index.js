@@ -29,14 +29,26 @@ const supabase = createClient(
 const ADMIN_TENANT_ID = process.env.ADMIN_TENANT_ID || 'admin'
 const sessions = new Map()
 const conversationBuffers = new Map()
-const MAX_BUFFER_MESSAGES = 5
 
 // ── Controle de proatividade e atividade por conversa ──
-const lastProactiveTime   = new Map() // key: tenantId_jid → timestamp
-const groupActivityWindow = new Map() // key: tenantId_jid → [timestamps]
-const PROACTIVE_COOLDOWN_MS   = 40000
-const ACTIVITY_WINDOW_MS      = 120000 // janela de 2 min para medir atividade
-const ACTIVE_GROUP_MSG_THRESH = 4      // msgs em 2min = grupo ativo
+const lastProactiveTime     = new Map() // tenantId_jid → timestamp último proativo
+const lastRealtimeAnalysis  = new Map() // tenantId_jid → timestamp última análise realtime
+const groupActivityWindow   = new Map() // tenantId_jid → [timestamps]
+
+// ── Defaults (substituídos pelos valores do dashboard) ──
+const DEFAULT_BUFFER_SIZE         = 6      // msgs pra acumular antes do learn completo
+const DEFAULT_PROACTIVE_COOLDOWN  = 40000  // ms entre intervenções proativas
+const DEFAULT_REALTIME_COOLDOWN   = 8000   // ms mínimo entre análises realtime por conversa
+const DEFAULT_ACTIVITY_WINDOW_MS  = 120000 // janela pra medir grupo ativo
+const DEFAULT_ACTIVE_THRESH       = 4      // msgs na janela = grupo ativo
+
+/** Lê config dinâmica com fallback pro default */
+function getCfg(configs, key, defaultVal) {
+    const val = configs?.proactive?.[key] ?? configs?.[key]
+    if (val === undefined || val === null || val === '') return defaultVal
+    const n = parseFloat(val)
+    return isNaN(n) ? defaultVal : n
+}
 
 // ── Sticker pack (WebP base64 paths em disco) ──
 const STICKER_DIR = path.join(__dirname, 'stickers')
@@ -64,15 +76,16 @@ function normalize(t) {
 }
 
 /** Registra atividade e retorna se o grupo está movimentado */
-function trackGroupActivity(key) {
+function trackGroupActivity(key, configs = {}) {
     const now = Date.now()
     if (!groupActivityWindow.has(key)) groupActivityWindow.set(key, [])
-    const times = groupActivityWindow.get(key)
+    const times  = groupActivityWindow.get(key)
+    const window = getCfg(configs, 'activity_window_ms', DEFAULT_ACTIVITY_WINDOW_MS)
+    const thresh = getCfg(configs, 'active_group_thresh', DEFAULT_ACTIVE_THRESH)
     times.push(now)
-    // Remove timestamps fora da janela
-    const cutoff = now - ACTIVITY_WINDOW_MS
+    const cutoff = now - window
     while (times.length && times[0] < cutoff) times.shift()
-    return times.length >= ACTIVE_GROUP_MSG_THRESH
+    return times.length >= thresh
 }
 
 /** Verifica se a mensagem é recente (ignora mensagens velhas ao reiniciar) */
@@ -702,6 +715,102 @@ Regras para "trigger": o que motivou (ex: "pergunta aberta", "piada", "polêmica
 }
 
 // ══════════════════════════════════════════════════
+// ANÁLISE REALTIME — decisão proativa por mensagem
+// ══════════════════════════════════════════════════
+async function realtimeProactiveAnalysis(tenantId, conversationId, messageText, author, configs, sock, isActiveGroup) {
+    const proactiveCfg = configs.proactive || {}
+    if (proactiveCfg.enabled === false || proactiveCfg.enabled === 'false') return
+    if (!messageText || messageText.length < 3) return
+
+    const chatCfg = configs.chat || {}
+    const apiKey  = chatCfg.api_key || configs.api_key || ''
+    if (!apiKey) return
+
+    const rtKey      = `rt_${tenantId}_${conversationId}`
+    const rtCooldown = getCfg(configs, 'realtime_cooldown_ms', DEFAULT_REALTIME_COOLDOWN)
+    if (Date.now() - (lastRealtimeAnalysis.get(rtKey) || 0) < rtCooldown) return
+    lastRealtimeAnalysis.set(rtKey, Date.now())
+
+    const proKey     = `${tenantId}_${conversationId}`
+    const cooldownMs = getCfg(configs, 'proactive_cooldown_ms', DEFAULT_PROACTIVE_COOLDOWN)
+    if (Date.now() - (lastProactiveTime.get(proKey) || 0) < cooldownMs) return
+
+    const personality = chatCfg.system_prompt || 'Voce e um membro humano do grupo.'
+    const activeHint  = isActiveGroup
+        ? 'O grupo esta MOVIMENTADO. Seja mais propensa a participar.'
+        : 'So participe se for algo realmente relevante.'
+    const frequency   = parseFloat(proactiveCfg.frequency || 0.15)
+
+    const prompt = `Voce e: "${personality}"
+${activeHint}
+
+${author} disse: "${messageText}"
+
+Analise APENAS esta mensagem e decida se vale participar AGORA.
+Retorne SOMENTE este JSON (sem texto, sem markdown):
+{"thought":"sua fala natural aqui ou vazio","urgency":0,"trigger":""}
+
+- thought: max 2 frases naturais. Vazio se nao ha nada genuino.
+- urgency: 0-10 (0=silencio, 5+=considerar, 8+=quase sempre, 10=imperdivel)
+- trigger: "pergunta","piada","polemica","nome_mencionado","celebracao" ou vazio`
+
+    try {
+        const response = await getAIResponse(prompt, configs, 'Responda APENAS com JSON de 3 campos.')
+        if (!response) return
+
+        const j = response.replace(/```json\s*/gi, '').replace(/```/g, '').trim()
+        const s = j.substring(j.indexOf('{'), j.lastIndexOf('}') + 1)
+        let parsed
+        try {
+            parsed = JSON.parse(s)
+        } catch (_) {
+            const mT = response.match(/"thought"\s*:\s*"((?:[^"\\]|\\.)*)"/)?.[1] || ''
+            const mU = response.match(/"urgency"\s*:\s*([0-9.]+)/)?.[1] || '0'
+            parsed = { thought: mT.trim(), urgency: parseFloat(mU), trigger: '' }
+        }
+
+        const thought = (parsed.thought || '').trim()
+        const urgency = parseFloat(parsed.urgency || 0)
+        const trigger = parsed.trigger || ''
+
+        if (!thought || thought.length < 3) return
+
+        const urgencyThresh = isActiveGroup
+            ? getCfg(configs, 'realtime_urgency_active', 5)
+            : getCfg(configs, 'realtime_urgency_idle',   7)
+
+        const roll        = Math.random()
+        const effectiveFreq = isActiveGroup ? Math.min(frequency * 2.5, 0.80) : frequency
+
+        const shouldFire = urgency >= urgencyThresh && (
+            urgency >= 9
+            || (urgency >= 7 && roll < 0.88)
+            || (urgency >= 5 && roll < effectiveFreq * 1.5)
+            || roll < effectiveFreq
+        )
+
+        console.log(`[RT] ${author} | urgency:${urgency} roll:${roll.toFixed(2)} thresh:${urgencyThresh} ativo:${isActiveGroup} -> ${shouldFire ? 'VAI' : 'nao'} "${thought?.substring(0,40)}"`)
+
+        if (shouldFire && sock) {
+            lastProactiveTime.set(proKey, Date.now())
+            const minDelay = urgency >= 8 ? 800  : urgency >= 5 ? 1500 : 3000
+            const maxDelay = urgency >= 8 ? 2500 : urgency >= 5 ? 5000 : 10000
+            const delay    = minDelay + Math.random() * (maxDelay - minDelay)
+            setTimeout(async () => {
+                try {
+                    await sendSmartResponse(sock, conversationId, thought, null, configs)
+                    console.log(`[RT] Enviado: "${thought?.substring(0,60)}"`)
+                } catch (e) {
+                    console.error('[RT] Erro ao enviar:', e.message)
+                }
+            }, delay)
+        }
+    } catch (err) {
+        console.error('[RT] Excecao:', err.message)
+    }
+}
+
+// ══════════════════════════════════════════════════
 // DETECÇÃO DE INTENÇÃO — Respostas rápidas sem IA
 // ══════════════════════════════════════════════════
 function detectSimpleIntent(text) {
@@ -783,7 +892,16 @@ async function loadTenantAIConfigs(tenantId) {
                     frequency: parseFloat(configs.proactive_frequency) || 0.15,
                     provider: configs.proactive_provider || configs.chat_provider || provider,
                     api_key: configs.proactive_api_key || configs[`${configs.proactive_provider || configs.chat_provider || provider}_api_key`] || '',
-                    model: configs.proactive_model || configs.chat_model || ''
+                    model: configs.proactive_model || configs.chat_model || '',
+                    // Parâmetros dinâmicos configuráveis pelo dashboard
+                    buffer_size:            parseInt(configs.buffer_size)            || DEFAULT_BUFFER_SIZE,
+                    proactive_cooldown_ms:  parseInt(configs.proactive_cooldown_ms)  || DEFAULT_PROACTIVE_COOLDOWN,
+                    realtime_cooldown_ms:   parseInt(configs.realtime_cooldown_ms)   || DEFAULT_REALTIME_COOLDOWN,
+                    activity_window_ms:     parseInt(configs.activity_window_ms)     || DEFAULT_ACTIVITY_WINDOW_MS,
+                    active_group_thresh:    parseInt(configs.active_group_thresh)    || DEFAULT_ACTIVE_THRESH,
+                    realtime_urgency_active: parseInt(configs.realtime_urgency_active) || 5,
+                    realtime_urgency_idle:   parseInt(configs.realtime_urgency_idle)   || 7,
+                    realtime_enabled:       configs.realtime_enabled !== 'false',
                 },
                 ai_provider: provider,
                 api_key: configs[`${provider}_api_key`] || process.env.GEMINI_API_KEY || '',
@@ -836,7 +954,15 @@ async function loadTenantAIConfigs(tenantId) {
                     frequency: parseFloat(d.proactive_frequency) || 0.15,
                     provider: d.proactive_provider || d.ai_provider || 'gemini',
                     api_key: d.proactive_api_key || d.api_key || '',
-                    model: d.proactive_model || d.model || ''
+                    model: d.proactive_model || d.model || '',
+                    buffer_size:            parseInt(d.buffer_size)            || DEFAULT_BUFFER_SIZE,
+                    proactive_cooldown_ms:  parseInt(d.proactive_cooldown_ms)  || DEFAULT_PROACTIVE_COOLDOWN,
+                    realtime_cooldown_ms:   parseInt(d.realtime_cooldown_ms)   || DEFAULT_REALTIME_COOLDOWN,
+                    activity_window_ms:     parseInt(d.activity_window_ms)     || DEFAULT_ACTIVITY_WINDOW_MS,
+                    active_group_thresh:    parseInt(d.active_group_thresh)    || DEFAULT_ACTIVE_THRESH,
+                    realtime_urgency_active: parseInt(d.realtime_urgency_active) || 5,
+                    realtime_urgency_idle:   parseInt(d.realtime_urgency_idle)   || 7,
+                    realtime_enabled:       d.realtime_enabled !== false,
                 },
                 ai_provider: d.ai_provider || 'gemini',
                 api_key: d.api_key || '',
@@ -1089,7 +1215,7 @@ async function connectToWhatsApp(tenantId, forceReset = false) {
             const author    = msg.pushName || remoteJid.split('@')[0]
             const authorJid = msg.key.participant || remoteJid
             const bufferKey = `${tenantId}_${remoteJid}`
-            const isActiveGroup = isGroup && trackGroupActivity(bufferKey)
+            const isActiveGroup = isGroup && trackGroupActivity(bufferKey, configs)
 
             if (!conversationBuffers.has(bufferKey)) conversationBuffers.set(bufferKey, { tenantId, messages: [] })
             const buffer = conversationBuffers.get(bufferKey)
@@ -1121,13 +1247,26 @@ async function connectToWhatsApp(tenantId, forceReset = false) {
                 }
             }
 
+            const bufferSize = getCfg(configs, 'buffer_size', DEFAULT_BUFFER_SIZE)
+
             if (bufferText.length > 2) {
                 buffer.messages.push({ author, authorJid, text: bufferText })
-                console.log(`[BUFFER] ${author}: "${bufferText.substring(0, 60)}" (${buffer.messages.length}/${MAX_BUFFER_MESSAGES}) ativo:${isActiveGroup}`)
+                console.log(`[BUFFER] ${author}: "${bufferText.substring(0, 60)}" (${buffer.messages.length}/${bufferSize}) ativo:${isActiveGroup}`)
             }
 
-            // ── Dispara aprendizado quando buffer cheio ──
-            if (buffer.messages.length >= MAX_BUFFER_MESSAGES && learningEnabled) {
+            // ── Análise realtime por mensagem (em paralelo, não bloqueia) ──
+            const realtimeEnabled = configs.proactive?.realtime_enabled !== false
+            if (isBotEnabled && isGroup && realtimeEnabled && bufferText.length > 3) {
+                const session2 = sessions.get(tenantId)
+                realtimeProactiveAnalysis(
+                    tenantId, remoteJid, bufferText, author, configs,
+                    session2?.sock && session2.status === 'authenticated' ? session2.sock : null,
+                    isActiveGroup
+                ).catch(e => console.error('[RT BG] Erro:', e.message))
+            }
+
+            // ── Dispara aprendizado completo quando buffer cheio ──
+            if (buffer.messages.length >= bufferSize && learningEnabled) {
                 const msgs = [...buffer.messages]
                 buffer.messages = []
                 learnFromConversation(tenantId, remoteJid, msgs, configs, isActiveGroup).catch(e =>
