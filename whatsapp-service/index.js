@@ -76,6 +76,7 @@ const sessions = new Map()
 const conversationBuffers = new Map()
 const waSessionDispatchState = new Map()
 const sessionContextSent = new Map() // Contexto completo só na 1ª msg por conversa — economiza tokens
+const activeRedRequests = new Set() // Previne listener duplo por sessionId
 
 // ── Controle de proatividade e atividade por conversa ──
 const lastProactiveTime     = new Map() // tenantId_jid → timestamp último proativo
@@ -774,6 +775,13 @@ async function getAIResponse(prompt, configs, overrideSystemPrompt = null, optio
                 return resolve(null);
             }
 
+            // Guard: se já tem listener ativo pra essa sessão, ignora duplicata
+            if (activeRedRequests.has(sessionId)) {
+                console.warn(`[AI] Já existe requisição ativa para ${sessionId}. Ignorando.`)
+                return resolve(null)
+            }
+            activeRedRequests.add(sessionId)
+
             let finished = false
             const responseHandler = (data) => {
                 if ((data.action === 'NEURAL_STREAM' || data.action === 'NEURAL_COMPLETE') && data.sessionId === sessionId) {
@@ -782,7 +790,9 @@ async function getAIResponse(prompt, configs, overrideSystemPrompt = null, optio
                     }
                 }
                 if (data.action === 'NEURAL_COMPLETE' && data.sessionId === sessionId) {
+                    if (finished) return
                     finished = true
+                    activeRedRequests.delete(sessionId)
                     eventEmitter.off('proxy_message', responseHandler);
                     let text = typeof data.text === 'string' ? data.text : ''
                     let files = []
@@ -825,6 +835,7 @@ async function getAIResponse(prompt, configs, overrideSystemPrompt = null, optio
             // Timeout ampliado para respostas com geração de arquivos
             setTimeout(() => {
                 if (finished) return
+                activeRedRequests.delete(sessionId)
                 eventEmitter.off('proxy_message', responseHandler);
                 resolve(null);
             }, 180000);
