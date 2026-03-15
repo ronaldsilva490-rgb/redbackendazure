@@ -528,12 +528,26 @@ async function getAIResponse(prompt, configs, overrideSystemPrompt = null) {
                     eventEmitter.off('proxy_message', responseHandler);
                     let text = typeof data.text === 'string' ? data.text : ''
                     if (!text && data?.data?.chunks?.length) {
-                        text = data.data.chunks
-                            .filter(c => c?.type === 'text' && typeof c.content === 'string')
-                            .map(c => c.content.trim())
-                            .filter(Boolean)
-                            .join('\n')
-                            .trim()
+                        text = data.data.chunks.map((c) => {
+                            if (!c || typeof c !== 'object') return ''
+                            if (c.type === 'text' && typeof c.content === 'string') {
+                                return c.content.trim()
+                            }
+                            if (c.type === 'heading' && typeof c.content === 'string') {
+                                return `*${c.content.trim()}*`
+                            }
+                            if (c.type === 'code' && typeof c.content === 'string') {
+                                const lang = typeof c.language === 'string' && c.language.trim() ? c.language.trim() : ''
+                                return lang ? `\`\`\`${lang}\n${c.content.trim()}\n\`\`\`` : `\`\`\`\n${c.content.trim()}\n\`\`\``
+                            }
+                            if (c.type === 'list' && Array.isArray(c.items)) {
+                                return c.items
+                                    .map((item, idx) => c.listType === 'ol' ? `${idx + 1}. ${String(item).trim()}` : `• ${String(item).trim()}`)
+                                    .join('\n')
+                                    .trim()
+                            }
+                            return ''
+                        }).filter(Boolean).join('\n\n').trim()
                     }
                     resolve(text || null);
                 }
