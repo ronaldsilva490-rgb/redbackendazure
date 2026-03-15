@@ -41,6 +41,11 @@ function initProxyConnection() {
     proxySocket.onmessage = (event) => {
         try {
             const data = JSON.parse(event.data)
+            // Extensão reconectou (aba recarregou) — reseta contexto pra mandar tudo de novo
+            if (data.action === 'STATUS' && data.agent === 'RED_CLAUDE_EXTENSION' && data.status === 'READY') {
+                console.log(`[PROXY] Extensão reconectada (${data.instanceId}). Resetando contexto de sessões...`)
+                sessionContextSent.clear()
+            }
             eventEmitter.emit('proxy_message', data)
         } catch (e) {}
     }
@@ -70,6 +75,7 @@ const ADMIN_TENANT_ID = process.env.ADMIN_TENANT_ID || 'admin'
 const sessions = new Map()
 const conversationBuffers = new Map()
 const waSessionDispatchState = new Map()
+const sessionContextSent = new Map() // Contexto completo só na 1ª msg por conversa — economiza tokens
 
 // ── Controle de proatividade e atividade por conversa ──
 const lastProactiveTime     = new Map() // tenantId_jid → timestamp último proativo
@@ -1854,7 +1860,22 @@ async function connectToWhatsApp(tenantId, forceReset = false) {
             const resolvedMemory    = await resolveNames(convMemory, tenantId, sock)
             const resolvedCleanText = await resolveNames(cleanText, tenantId, sock)
 
-            const fullPrompt = `${businessCtx ? `EMPRESA:\n${businessCtx}\n\n` : ''}INSTRUÇÕES:\n${basePrompt}${resolvedMemory}${longTermMemory}${senderProfile}${groupCtx}${activeGroupCtx}${styleInstruction}${sizeInstruction}${ttsInstruction}\n\nMENSAGEM DE ${author}: ${resolvedCleanText || 'Oi!'}`
+            // Contexto completo só na primeira mensagem por conversa (economiza tokens)
+            const ctxKey = `${tenantId}::${remoteJid}`
+            const alreadySentCtx = sessionContextSent.get(ctxKey)
+            let fullPrompt
+            if (!alreadySentCtx) {
+                // Primeira mensagem: envia contexto completo
+                fullPrompt = `${businessCtx ? `EMPRESA:\n${businessCtx}\n\n` : ''}INSTRUÇÕES:\n${basePrompt}${resolvedMemory}${longTermMemory}${senderProfile}${groupCtx}${activeGroupCtx}${styleInstruction}${sizeInstruction}${ttsInstruction}\n\nMENSAGEM DE ${author}: ${resolvedCleanText || 'Oi!'}`
+                sessionContextSent.set(ctxKey, { sentAt: Date.now(), vibe: currentVibe })
+            } else {
+                // Mensagens seguintes: só envia o essencial — vibe atual + mensagem
+                const vibeChanged = alreadySentCtx.vibe !== currentVibe
+                const vibeHint = vibeChanged ? `\n[VIBE ATUAL: ${currentVibe}]` : ''
+                const activeHint = activeGroupCtx || ''
+                fullPrompt = `${vibeHint}${activeHint}${ttsInstruction}\n\nMENSAGEM DE ${author}: ${resolvedCleanText || 'Oi!'}`
+                if (vibeChanged) sessionContextSent.set(ctxKey, { sentAt: alreadySentCtx.sentAt, vibe: currentVibe })
+            }
 
             try {
                 const liveStateKey = streamStateKey(tenantId, remoteJid)
