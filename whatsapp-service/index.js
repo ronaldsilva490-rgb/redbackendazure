@@ -16,6 +16,46 @@ const QRCode = require('qrcode')
 const pino = require('pino')
 const path = require('path')
 const fs = require('fs')
+const EventEmitter = require('events')
+const eventEmitter = new EventEmitter()
+
+const WebSocket = require('ws')
+let proxySocket = null
+const proxyUrl = process.env.RED_PROXY_URL || 'ws://automais.ddns.net:11434'
+
+function initProxyConnection() {
+    if (proxySocket && (proxySocket.readyState === WebSocket.OPEN || proxySocket.readyState === WebSocket.CONNECTING)) return
+    
+    console.log(`[PROXY] Conectando ao RED Proxy: ${proxyUrl}`)
+    proxySocket = new WebSocket(proxyUrl)
+
+    proxySocket.onopen = () => {
+        console.log(`[PROXY] Conectado ao RED Proxy com sucesso.`)
+        proxySocket.send(JSON.stringify({
+            action: 'STATUS',
+            agent: 'LOCAL_FRONTEND',
+            sessionId: 'WHATSAPP_SERVICE'
+        }))
+    }
+
+    proxySocket.onmessage = (event) => {
+        try {
+            const data = JSON.parse(event.data)
+            eventEmitter.emit('proxy_message', data)
+        } catch (e) {}
+    }
+
+    proxySocket.onclose = () => {
+        console.log(`[PROXY] Conexão fechada. Tentando reconectar em 5s...`)
+        setTimeout(initProxyConnection, 5000)
+    }
+
+    proxySocket.onerror = (err) => {
+        console.error(`[PROXY] Erro na conexão:`, err.message)
+    }
+}
+
+initProxyConnection()
 
 const app = express()
 app.use(cors())
@@ -435,9 +475,51 @@ async function getAIResponse(prompt, configs, overrideSystemPrompt = null) {
     const model = chatCfg.model || configs.model || ''
     const systemPrompt = overrideSystemPrompt || chatCfg.system_prompt || configs.system_prompt || 'Você é um assistente.'
 
-    if (!apiKey || !model) { console.warn(`[AI] Config incompleta (${provider})`); return null }
+    if (provider !== 'red-claude' && (!apiKey || !model)) { 
+        console.warn(`[AI] Config incompleta (${provider})`); 
+        return null 
+    }
 
     try {
+        if (provider === 'red-claude') {
+            const instanceId = chatCfg.red_instance_id || configs.red_instance_id;
+            if (!instanceId) {
+                console.error("[AI] RED Claude selecionado, mas red_instance_id não configurado.");
+                return null;
+            }
+
+            const sessionId = `WA_${configs.tenant_id || 'default'}_${Math.random().toString(36).substring(7)}`;
+            
+            return new Promise((resolve) => {
+                if (!proxySocket || proxySocket.readyState !== WebSocket.OPEN) {
+                    console.error("[AI] Proxy RED não está conectado.");
+                    return resolve(null);
+                }
+
+                const responseHandler = (data) => {
+                    if (data.action === 'NEURAL_COMPLETE' && data.sessionId === sessionId) {
+                        eventEmitter.off('proxy_message', responseHandler);
+                        resolve(data.text);
+                    }
+                };
+
+                eventEmitter.on('proxy_message', responseHandler);
+
+                proxySocket.send(JSON.stringify({
+                    action: "START_NEURAL_LINK",
+                    text: `${systemPrompt}\n\n${prompt}`,
+                    instanceId: instanceId,
+                    sessionId: sessionId
+                }));
+
+                // Timeout de 90 segundos para o Claude responder
+                setTimeout(() => {
+                    eventEmitter.off('proxy_message', responseHandler);
+                    resolve(null);
+                }, 90000);
+            });
+        }
+
         if (provider === 'gemini') {
             const genAI = new GoogleGenerativeAI(apiKey)
             const mdl = genAI.getGenerativeModel({ model, systemInstruction: systemPrompt })
@@ -907,7 +989,9 @@ async function loadTenantAIConfigs(tenantId) {
                     provider: configs.chat_provider || provider,
                     api_key: configs[`${configs.chat_provider || provider}_api_key`] || configs[`${provider}_api_key`] || process.env.GEMINI_API_KEY || '',
                     model: configs.chat_model || configs[`${provider}_model`] || 'gemini-2.0-flash',
-                    system_prompt: configs.chat_system_prompt || configs[`${provider}_system_prompt`] || 'Você é o assistente RED.IA.'
+                    system_prompt: configs.chat_system_prompt || configs[`${provider}_system_prompt`] || 'Você é o assistente RED.IA.',
+                    red_instance_id: configs.red_instance_id || '',
+                    red_proxy_url: configs.red_proxy_url || ''
                 },
                 stt: {
                     provider: configs.stt_provider || 'groq',
@@ -969,7 +1053,9 @@ async function loadTenantAIConfigs(tenantId) {
                     provider: d.chat_provider || d.ai_provider || 'gemini',
                     api_key: d.chat_api_key || d.api_key || '',
                     model: d.chat_model || d.model || '',
-                    system_prompt: d.system_prompt || 'Você é o assistente virtual.'
+                    system_prompt: d.system_prompt || 'Você é o assistente virtual.',
+                    red_instance_id: d.red_instance_id || '',
+                    red_proxy_url: d.red_proxy_url || ''
                 },
                 stt: {
                     provider: d.stt_provider || 'groq',

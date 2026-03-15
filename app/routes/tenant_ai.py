@@ -22,12 +22,14 @@ def get_tenant_ai_config():
         # Retorna valores padrão se não existir
         return success({
             "ai_enabled": False,
-            "ai_provider": "gemini",
-            "api_key": "",
-            "model": "",
-            "system_prompt": "Você é um assistente virtual prestativo e descontraído.",
-            "ai_prefix": ""
-        })
+        "ai_provider": "gemini",
+        "api_key": "",
+        "model": "",
+        "system_prompt": "Você é um assistente virtual prestativo e descontraído.",
+        "ai_prefix": "",
+        "red_instance_id": "",
+        "red_proxy_url": "ws://automais.ddns.net:11434"
+    })
     
     return success(resp.data)
 
@@ -48,6 +50,8 @@ def save_tenant_ai_config():
         "model": body.get("model"),
         "system_prompt": body.get("system_prompt"),
         "ai_prefix": body.get("ai_prefix"),
+        "red_instance_id": body.get("red_instance_id"),
+        "red_proxy_url": body.get("red_proxy_url"),
         "updated_at": "now()"
     }
     
