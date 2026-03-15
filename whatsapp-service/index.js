@@ -457,12 +457,13 @@ function formatForWhatsApp(text) {
 }
 
 async function sendSmartResponse(sock, remoteJid, text, quotedMsg, configs, extraOpts = {}) {
+    const attachmentFiles = Array.isArray(extraOpts.files) ? extraOpts.files : []
     const waText = formatForWhatsApp(text)
     const ttsCfg = configs.tts || {}
     const ttsEnabled = ttsCfg.enabled === true || ttsCfg.enabled === 'true'
     const shouldSendAudio = ttsEnabled && Math.random() < (parseFloat(ttsCfg.audio_probability) || 0.3)
 
-    if (shouldSendAudio && waText.length < 500) {
+    if (shouldSendAudio && waText.length < 500 && attachmentFiles.length === 0) {
         try {
             await sock.sendPresenceUpdate('recording', remoteJid)
             const audioBuffer = await generateAudio(waText, configs)
@@ -484,13 +485,60 @@ async function sendSmartResponse(sock, remoteJid, text, quotedMsg, configs, extr
         await sock.sendPresenceUpdate('available', remoteJid)
     } catch (_) {}
 
-    await sock.sendMessage(remoteJid, { text: waText }, { quoted: quotedMsg })
+    if (attachmentFiles.length) {
+        const sentWithCaption = await sendRemoteFilesToWhatsApp(sock, remoteJid, attachmentFiles, quotedMsg, waText)
+        if (!sentWithCaption && waText) {
+            await sock.sendMessage(remoteJid, { text: waText }, { quoted: quotedMsg })
+            await sendRemoteFilesToWhatsApp(sock, remoteJid, attachmentFiles, quotedMsg, '')
+        }
+        return
+    }
+
+    if (waText) await sock.sendMessage(remoteJid, { text: waText }, { quoted: quotedMsg })
+}
+
+async function sendRemoteFilesToWhatsApp(sock, remoteJid, files, quotedMsg, captionText = '') {
+    let sentAny = false
+    let captionPending = !!captionText
+    for (const f of files) {
+        try {
+            let buffer = null
+            if (typeof f?.dataBase64 === 'string' && f.dataBase64.trim()) {
+                buffer = Buffer.from(f.dataBase64, 'base64')
+            } else {
+                const url = typeof f?.url === 'string' ? f.url.trim() : ''
+                if (!/^https?:\/\//i.test(url)) continue
+                const resp = await fetch(url, { method: 'GET' })
+                if (!resp.ok) continue
+                const arr = await resp.arrayBuffer()
+                buffer = Buffer.from(arr)
+                if (!f?.mimeType) f.mimeType = resp.headers.get('content-type') || 'application/octet-stream'
+                if (!f?.name) {
+                    try { f.name = decodeURIComponent(new URL(url).pathname.split('/').filter(Boolean).pop() || 'arquivo') } catch (_) { f.name = 'arquivo' }
+                }
+            }
+            if (!buffer.length) continue
+            let fileName = typeof f?.name === 'string' ? f.name.trim() : ''
+            if (!fileName) {
+                fileName = 'arquivo'
+            }
+            const mime = f?.mimeType || 'application/octet-stream'
+            const message = { document: buffer, fileName, mimetype: mime }
+            if (captionPending) {
+                message.caption = captionText
+                captionPending = false
+            }
+            await sock.sendMessage(remoteJid, message, { quoted: quotedMsg })
+            sentAny = true
+        } catch (_) {}
+    }
+    return sentAny
 }
 
 // ══════════════════════════════════════════════════
 // CORE IA — Geração de Resposta
 // ══════════════════════════════════════════════════
-async function getAIResponse(prompt, configs, overrideSystemPrompt = null) {
+async function getAIResponse(prompt, configs, overrideSystemPrompt = null, options = {}) {
     const chatCfg = configs.chat || {}
     
     // FORÇAR RED-CLAUDE SE HOUVER INSTANCE ID
@@ -527,6 +575,17 @@ async function getAIResponse(prompt, configs, overrideSystemPrompt = null) {
                     finished = true
                     eventEmitter.off('proxy_message', responseHandler);
                     let text = typeof data.text === 'string' ? data.text : ''
+                    let files = []
+                    if (Array.isArray(data.files)) {
+                        files = data.files
+                            .filter(f => (typeof f?.url === 'string' && f.url) || (typeof f?.dataBase64 === 'string' && f.dataBase64))
+                            .map(f => ({
+                                name: typeof f.name === 'string' ? f.name : 'arquivo',
+                                url: typeof f.url === 'string' ? f.url : '',
+                                mimeType: typeof f.mimeType === 'string' ? f.mimeType : 'application/octet-stream',
+                                dataBase64: typeof f.dataBase64 === 'string' ? f.dataBase64 : ''
+                            }))
+                    }
                     if (!text && data?.data?.chunks?.length) {
                         text = data.data.chunks.map((c) => {
                             if (!c || typeof c !== 'object') return ''
@@ -549,7 +608,15 @@ async function getAIResponse(prompt, configs, overrideSystemPrompt = null) {
                             return ''
                         }).filter(Boolean).join('\n\n').trim()
                     }
-                    resolve(text || null);
+                    if (!files.length && data?.data?.chunks?.length) {
+                        const seen = new Set()
+                        files = data.data.chunks
+                            .filter(c => c?.type === 'file' && typeof c.url === 'string')
+                            .map(c => ({ name: typeof c.name === 'string' ? c.name : 'arquivo', url: c.url, mimeType: 'application/octet-stream', dataBase64: '' }))
+                            .filter(f => /^https?:\/\//i.test(f.url) && !seen.has(f.url) && seen.add(f.url))
+                    }
+                    if (options?.includeMeta) resolve({ text: text || null, files })
+                    else resolve(text || null);
                 }
             };
 
@@ -587,7 +654,7 @@ async function getAIResponse(prompt, configs, overrideSystemPrompt = null) {
     // Se não for RED Claude, validar chaves para outros providers
     if (!apiKey && provider !== 'ollama') {
         console.warn(`[AI] Config incompleta (${provider})`);
-        return null;
+                return options?.includeMeta ? { text: null, files: [] } : null;
     }
 
     try {
@@ -595,7 +662,8 @@ async function getAIResponse(prompt, configs, overrideSystemPrompt = null) {
             const genAI = new GoogleGenerativeAI(apiKey)
             const mdl = genAI.getGenerativeModel({ model, systemInstruction: systemPrompt })
             const result = await mdl.generateContent(prompt)
-            return result.response.text()
+            const out = result.response.text()
+            return options?.includeMeta ? { text: out, files: [] } : out
         }
 
         let apiUrl = ''
@@ -626,11 +694,12 @@ async function getAIResponse(prompt, configs, overrideSystemPrompt = null) {
             })
         })
         const data = await resp.json()
-        if (data.error) { console.error(`[AI] Erro ${provider}:`, data.error); return null }
-        return data.choices?.[0]?.message?.content || null
+        if (data.error) { console.error(`[AI] Erro ${provider}:`, data.error); return options?.includeMeta ? { text: null, files: [] } : null }
+        const out = data.choices?.[0]?.message?.content || null
+        return options?.includeMeta ? { text: out, files: [] } : out
     } catch (err) {
         console.error(`[AI] Exceção (${provider}):`, err.message)
-        return null
+        return options?.includeMeta ? { text: null, files: [] } : null
     }
 }
 
@@ -1620,8 +1689,10 @@ async function connectToWhatsApp(tenantId, forceReset = false) {
             const fullPrompt = `${businessCtx ? `EMPRESA:\n${businessCtx}\n\n` : ''}INSTRUÇÕES:\n${basePrompt}${resolvedMemory}${longTermMemory}${senderProfile}${groupCtx}${activeGroupCtx}${styleInstruction}${sizeInstruction}${ttsInstruction}\n\nMENSAGEM DE ${author}: ${resolvedCleanText || 'Oi!'}`
 
             try {
-                const response = await getAIResponse(fullPrompt, configs)
-                if (response) {
+                const aiResult = await getAIResponse(fullPrompt, configs, null, { includeMeta: true })
+                const response = typeof aiResult === 'string' ? aiResult : (aiResult?.text || null)
+                const files = Array.isArray(aiResult?.files) ? aiResult.files : []
+                if (response || files.length) {
                     // Às vezes envia sticker junto (só em grupos animados)
                     if (isGroup && isActiveGroup && Math.random() < 0.08) {
                         const mood = currentVibe.toLowerCase().includes('zoeira') ? 'laugh'
@@ -1631,7 +1702,7 @@ async function connectToWhatsApp(tenantId, forceReset = false) {
                             await humanDelay(600 + Math.random() * 800)
                         }
                     }
-                    await sendSmartResponse(sock, remoteJid, response, msg, configs)
+                    await sendSmartResponse(sock, remoteJid, response || '📎 Arquivo gerado.', msg, configs, { files })
                 } else {
                     if (isPV) await sock.sendMessage(remoteJid, { text: 'Sem conexão com o modelo agora, tenta de novo!' }, { quoted: msg })
                 }
