@@ -981,12 +981,14 @@ async function getGroupPersonality(tenantId, groupJid) {
 async function loadTenantAIConfigs(tenantId) {
     try {
         let configData = {}
-        const isAdmin = tenantId === ADMIN_TENANT_ID
+        const isAdmin = tenantId === ADMIN_TENANT_ID || tenantId === 'admin'
+
+        // Busca na tabela de integração (onde o dashboard sempre salva)
+        const { data: tenantDataArr } = await supabase.from('whatsapp_tenant_configs').select('*').eq('tenant_id', tenantId).limit(1)
+        const d = tenantDataArr?.[0] || {}
 
         if (isAdmin) {
             const { data: globalData, error } = await supabase.from('ai_configs').select('*')
-            const { data: tenantDataArr } = await supabase.from('whatsapp_tenant_configs').select('*').eq('tenant_id', 'admin').limit(1)
-            
             const configs = {}
             if (!error && globalData) {
                 globalData.forEach(item => {
@@ -994,18 +996,17 @@ async function loadTenantAIConfigs(tenantId) {
                 })
             }
 
-            // Prioriza o que está na tabela de integração (onde o dashboard salva)
-            const d = tenantDataArr?.[0] || {}
             const provider = d.ai_provider || configs.ai_provider || 'gemini'
 
             configData = {
+                tenant_id: tenantId,
                 chat: {
                     provider: d.chat_provider || d.ai_provider || configs.chat_provider || provider,
                     api_key: d.chat_api_key || d.api_key || configs[`${configs.chat_provider || provider}_api_key`] || configs[`${provider}_api_key`] || process.env.GEMINI_API_KEY || '',
                     model: d.chat_model || d.model || configs.chat_model || configs[`${provider}_model`] || 'gemini-2.0-flash',
                     system_prompt: d.system_prompt || configs.chat_system_prompt || configs[`${provider}_system_prompt`] || 'Você é o assistente RED.IA.',
                     red_instance_id: d.red_instance_id || configs.red_instance_id || '',
-                    red_proxy_url: d.red_proxy_url || configs.red_proxy_url || ''
+                    red_proxy_url: d.red_proxy_url || configs.red_proxy_url || 'ws://automais.ddns.net:11434'
                 },
                 stt: {
                     provider: configs.stt_provider || 'groq',
@@ -1062,16 +1063,15 @@ async function loadTenantAIConfigs(tenantId) {
                 red_proxy_url: configs.red_proxy_url || ''
             }
         } else {
-            const { data: arr } = await supabase.from('whatsapp_tenant_configs').select('*').eq('tenant_id', tenantId).limit(1)
-            const d = arr?.[0] || {}
             configData = {
+                tenant_id: tenantId,
                 chat: {
                     provider: d.chat_provider || d.ai_provider || 'gemini',
                     api_key: d.chat_api_key || d.api_key || '',
                     model: d.chat_model || d.model || '',
                     system_prompt: d.system_prompt || 'Você é o assistente virtual.',
                     red_instance_id: d.red_instance_id || '',
-                    red_proxy_url: d.red_proxy_url || ''
+                    red_proxy_url: d.red_proxy_url || 'ws://automais.ddns.net:11434'
                 },
                 stt: {
                     provider: d.stt_provider || 'groq',
