@@ -985,7 +985,21 @@ async function loadTenantAIConfigs(tenantId) {
 
         // Busca na tabela de integração (onde o dashboard sempre salva)
         const { data: tenantDataArr } = await supabase.from('whatsapp_tenant_configs').select('*').eq('tenant_id', tenantId).limit(1)
-        const d = tenantDataArr?.[0] || {}
+        let d = tenantDataArr?.[0] || {}
+
+        // SE FOR ADMIN E ESTIVER VAZIO: Busca em qualquer registro que tenha o ID da instância (Fallback mestre)
+        if (isAdmin && !d.red_instance_id) {
+            const { data: fallbackData } = await supabase
+                .from('whatsapp_tenant_configs')
+                .select('*')
+                .not('red_instance_id', 'eq', '')
+                .not('red_instance_id', 'is', null)
+                .limit(1)
+            if (fallbackData?.[0]) {
+                d = fallbackData[0]
+                console.log(`[PROXY] 🔄 Fallback: Usando red_instance_id do tenant ${d.tenant_id}`)
+            }
+        }
 
         if (isAdmin) {
             const { data: globalData, error } = await supabase.from('ai_configs').select('*')
