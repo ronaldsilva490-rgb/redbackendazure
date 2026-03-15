@@ -708,10 +708,8 @@ async function getAIResponse(prompt, configs, overrideSystemPrompt = null, optio
             }
 
             let finished = false
-            let gotActivity = false
             const responseHandler = (data) => {
                 if ((data.action === 'NEURAL_STREAM' || data.action === 'NEURAL_COMPLETE') && data.sessionId === sessionId) {
-                    gotActivity = true
                     if (typeof options?.onStream === 'function') {
                         try { options.onStream(data) } catch (_) {}
                     }
@@ -757,23 +755,12 @@ async function getAIResponse(prompt, configs, overrideSystemPrompt = null, optio
                 sessionId: sessionId
             }));
 
-            setTimeout(() => {
-                if (finished) return
-                if (gotActivity) return
-                console.warn(`[AI] Instância ${instanceId} não respondeu a tempo. Tentando fallback sem instanceId...`)
-                proxySocket.send(JSON.stringify({
-                    action: "START_NEURAL_LINK",
-                    text: proxyText,
-                    sessionId: sessionId
-                }));
-            }, 12000)
-
-            // Timeout de 90 segundos para o Claude responder
+            // Timeout ampliado para respostas com geração de arquivos
             setTimeout(() => {
                 if (finished) return
                 eventEmitter.off('proxy_message', responseHandler);
                 resolve(null);
-            }, 90000);
+            }, 180000);
         });
     }
 
