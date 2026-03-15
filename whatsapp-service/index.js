@@ -479,48 +479,52 @@ async function getAIResponse(prompt, configs, overrideSystemPrompt = null) {
     const systemPrompt = overrideSystemPrompt || chatCfg.system_prompt || configs.system_prompt || 'Você é um assistente.'
 
     if (provider === 'red-claude') {
-        const instanceId = chatCfg.red_instance_id || configs.red_instance_id || configs.red_instance_id;
+        const instanceId = chatCfg.red_instance_id || configs.red_instance_id;
         
         if (!instanceId) {
-            console.error(`[AI] RED Claude selecionado para ${configs.tenant_id || 'unknown'}, mas red_instance_id não encontrado em:`, {
-                chat_red_id: chatCfg.red_instance_id,
-                root_red_id: configs.red_instance_id
-            });
+            console.error(`[AI] RED Claude selecionado para ${configs.tenant_id || 'unknown'}, mas red_instance_id não encontrado.`);
             return null;
         }
 
-            const sessionId = `WA_${configs.tenant_id || 'default'}_${Math.random().toString(36).substring(7)}`;
-            
-            return new Promise((resolve) => {
-                if (!proxySocket || proxySocket.readyState !== WebSocket.OPEN) {
-                    console.error("[AI] Proxy RED não está conectado.");
-                    return resolve(null);
-                }
+        const sessionId = `WA_${configs.tenant_id || 'default'}_${Math.random().toString(36).substring(7)}`;
+        
+        return new Promise((resolve) => {
+            if (!proxySocket || proxySocket.readyState !== WebSocket.OPEN) {
+                console.error("[AI] Proxy RED não está conectado.");
+                return resolve(null);
+            }
 
-                const responseHandler = (data) => {
-                    if (data.action === 'NEURAL_COMPLETE' && data.sessionId === sessionId) {
-                        eventEmitter.off('proxy_message', responseHandler);
-                        resolve(data.text);
-                    }
-                };
-
-                eventEmitter.on('proxy_message', responseHandler);
-
-                proxySocket.send(JSON.stringify({
-                    action: "START_NEURAL_LINK",
-                    text: `${systemPrompt}\n\n${prompt}`,
-                    instanceId: instanceId,
-                    sessionId: sessionId
-                }));
-
-                // Timeout de 90 segundos para o Claude responder
-                setTimeout(() => {
+            const responseHandler = (data) => {
+                if (data.action === 'NEURAL_COMPLETE' && data.sessionId === sessionId) {
                     eventEmitter.off('proxy_message', responseHandler);
-                    resolve(null);
-                }, 90000);
-            });
-        }
+                    resolve(data.text);
+                }
+            };
 
+            eventEmitter.on('proxy_message', responseHandler);
+
+            proxySocket.send(JSON.stringify({
+                action: "START_NEURAL_LINK",
+                text: `${systemPrompt}\n\n${prompt}`,
+                instanceId: instanceId,
+                sessionId: sessionId
+            }));
+
+            // Timeout de 90 segundos para o Claude responder
+            setTimeout(() => {
+                eventEmitter.off('proxy_message', responseHandler);
+                resolve(null);
+            }, 90000);
+        });
+    }
+
+    // Se não for RED Claude, validar chaves para outros providers
+    if (!apiKey && provider !== 'ollama') {
+        console.warn(`[AI] Config incompleta (${provider})`);
+        return null;
+    }
+
+    try {
         if (provider === 'gemini') {
             const genAI = new GoogleGenerativeAI(apiKey)
             const mdl = genAI.getGenerativeModel({ model, systemInstruction: systemPrompt })
