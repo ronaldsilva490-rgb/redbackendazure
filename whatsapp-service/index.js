@@ -767,7 +767,8 @@ async function getAIResponse(prompt, configs, overrideSystemPrompt = null, optio
             return null;
         }
 
-        const sessionId = `WA_${configs.tenant_id || 'default'}`;
+        // ID único por requisição — sem bloqueio de fila entre mensagens simultâneas
+        const sessionId = `WA_${configs.tenant_id || 'default'}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
         
         return new Promise((resolve) => {
             if (!proxySocket || proxySocket.readyState !== WebSocket.OPEN) {
@@ -775,11 +776,6 @@ async function getAIResponse(prompt, configs, overrideSystemPrompt = null, optio
                 return resolve(null);
             }
 
-            // Guard: se já tem listener ativo pra essa sessão, ignora duplicata
-            if (activeRedRequests.has(sessionId)) {
-                console.warn(`[AI] Já existe requisição ativa para ${sessionId}. Ignorando.`)
-                return resolve(null)
-            }
             activeRedRequests.add(sessionId)
 
             let finished = false
@@ -1302,176 +1298,113 @@ async function getGroupPersonality(tenantId, groupJid) {
 }
 
 // ══════════════════════════════════════════════════
-// CARREGAMENTO DE CONFIGS DO TENANT
+// CARREGAMENTO DE CONFIGS DO TENANT — lê do JSON local
 // ══════════════════════════════════════════════════
+const AI_CONFIG_PATH = path.join(__dirname, 'ai_config.json')
+let _aiConfigCache = null
+let _aiConfigMtime = 0
+
+function loadAIConfigFile() {
+    try {
+        const stat = fs.statSync(AI_CONFIG_PATH)
+        const mtime = stat.mtimeMs
+        if (_aiConfigCache && mtime === _aiConfigMtime) return _aiConfigCache
+        const raw = fs.readFileSync(AI_CONFIG_PATH, 'utf8')
+        _aiConfigCache = JSON.parse(raw)
+        _aiConfigMtime = mtime
+        console.log('[CONFIG] ✅ ai_config.json recarregado')
+        return _aiConfigCache
+    } catch (err) {
+        console.error('[CONFIG] ❌ Erro ao ler ai_config.json:', err.message)
+        return {}
+    }
+}
+
 async function loadTenantAIConfigs(tenantId) {
     try {
-        let configData = {}
-        const isAdmin = tenantId === ADMIN_TENANT_ID || tenantId === 'admin'
+        const fileConfig = loadAIConfigFile()
 
-        // Busca na tabela de integração (onde o dashboard sempre salva)
-        const { data: tenantDataArr } = await supabase.from('whatsapp_tenant_configs').select('*').eq('tenant_id', tenantId).limit(1)
-        let d = tenantDataArr?.[0] || {}
+        // Tenta config específica do tenant, cai no "admin" como padrão
+        const d = fileConfig[tenantId] || fileConfig['admin'] || {}
 
-        // SE FOR ADMIN E ESTIVER VAZIO: Busca em qualquer registro que tenha o ID da instância (Fallback mestre)
-        if (isAdmin && !d.red_instance_id) {
-            const { data: fallbackData } = await supabase
-                .from('whatsapp_tenant_configs')
-                .select('*')
-                .not('red_instance_id', 'eq', '')
-                .not('red_instance_id', 'is', null)
-                .limit(1)
-            if (fallbackData?.[0]) {
-                d = {
-                    ...d,
-                    red_instance_id: fallbackData[0].red_instance_id || d.red_instance_id || '',
-                    red_proxy_url: fallbackData[0].red_proxy_url || d.red_proxy_url || ''
-                }
-                console.log(`[PROXY] 🔄 Fallback: Usando red_instance_id do tenant ${fallbackData[0].tenant_id}`)
-            }
-        }
+        const chat      = d.chat      || {}
+        const stt       = d.stt       || {}
+        const vision    = d.vision    || {}
+        const tts       = d.tts       || {}
+        const learning  = d.learning  || {}
+        const proactive = d.proactive || {}
 
-        if (isAdmin) {
-            const { data: globalData, error } = await supabase.from('ai_configs').select('*')
-            const configs = {}
-            if (!error && globalData) {
-                globalData.forEach(item => {
-                    if (item.key) configs[item.key] = item.value
-                })
-            }
+        const configData = {
+            tenant_id: tenantId,
 
-            // PRIORIDADE: Se existe config no painel de WhatsApp, usa o prompt de lá (mesmo que vazio).
-            const hasTenantConfig = !!tenantDataArr?.[0]
-            const provider = d.ai_provider || configs.ai_provider || 'gemini'
+            chat: {
+                provider:       chat.provider       || 'groq',
+                api_key:        chat.api_key        || process.env.GROQ_API_KEY || process.env.GEMINI_API_KEY || '',
+                model:          chat.model          || 'llama-3.3-70b-versatile',
+                system_prompt:  chat.system_prompt  || 'Você é um assistente.',
+                red_instance_id: chat.red_instance_id || d.red_instance_id || '',
+                red_proxy_url:  chat.red_proxy_url  || d.red_proxy_url || 'ws://automais.ddns.net:11434'
+            },
 
-            configData = {
-                tenant_id: tenantId,
-                chat: {
-                    provider: d.chat_provider || d.ai_provider || configs.chat_provider || provider,
-                    api_key: d.chat_api_key || d.api_key || configs[`${configs.chat_provider || provider}_api_key`] || configs[`${provider}_api_key`] || process.env.GEMINI_API_KEY || '',
-                    model: d.chat_model || d.model || configs.chat_model || configs[`${provider}_model`] || 'gemini-2.0-flash',
-                    system_prompt: hasTenantConfig ? (d.system_prompt || '') : (d.system_prompt || configs.chat_system_prompt || configs[`${provider}_system_prompt`] || ''),
-                    red_instance_id: d.red_instance_id || configs.red_instance_id || '',
-                    red_proxy_url: d.red_proxy_url || configs.red_proxy_url || 'ws://automais.ddns.net:11434'
-                },
-                stt: {
-                    provider: configs.stt_provider || 'groq',
-                    api_key: configs.stt_api_key || configs.groq_api_key || '',
-                    model: configs.stt_model || 'whisper-large-v3-turbo',
-                    enabled: configs.stt_enabled !== 'false'
-                },
-                vision: {
-                    provider: configs.vision_provider || 'gemini',
-                    api_key: configs.vision_api_key || configs.gemini_api_key || process.env.GEMINI_API_KEY || '',
-                    model: configs.vision_model || 'gemini-2.0-flash',
-                    enabled: configs.vision_enabled !== 'false'
-                },
-                tts: {
-                    provider: configs.tts_provider || 'edge',
-                    api_key: configs.tts_api_key || '',
-                    model: configs.tts_model || '',
-                    voice_id: configs.tts_voice_id || 'pt-BR-FranciscaNeural',
-                    enabled: configs.tts_enabled === 'true',
-                    audio_probability: parseFloat(configs.tts_audio_probability) || 0.3,
-                    rate: configs.tts_rate || '-5%',
-                    pitch: configs.tts_pitch || '+0Hz',
-                    volume: configs.tts_volume || '+0%'
-                },
-                learning: {
-                    provider: configs.learning_provider || configs.chat_provider || provider,
-                    api_key: configs.learning_api_key || configs[`${provider}_api_key`] || '',
-                    model: configs.learning_model || configs[`${provider}_model`] || 'gemini-2.0-flash',
-                    enabled: configs.learning_enabled !== 'false'
-                },
-                proactive: {
-                    enabled: configs.proactive_enabled !== 'false',
-                    frequency: parseFloat(configs.proactive_frequency) || 0.15,
-                    provider: configs.proactive_provider || configs.chat_provider || provider,
-                    api_key: configs.proactive_api_key || configs[`${configs.proactive_provider || configs.chat_provider || provider}_api_key`] || '',
-                    model: configs.proactive_model || configs.chat_model || '',
-                    // Parâmetros dinâmicos configuráveis pelo dashboard
-                    buffer_size:            parseInt(configs.buffer_size)            || DEFAULT_BUFFER_SIZE,
-                    proactive_cooldown_ms:  parseInt(configs.proactive_cooldown_ms)  || DEFAULT_PROACTIVE_COOLDOWN,
-                    realtime_cooldown_ms:   parseInt(configs.realtime_cooldown_ms)   || DEFAULT_REALTIME_COOLDOWN,
-                    activity_window_ms:     parseInt(configs.activity_window_ms)     || DEFAULT_ACTIVITY_WINDOW_MS,
-                    active_group_thresh:    parseInt(configs.active_group_thresh)    || DEFAULT_ACTIVE_THRESH,
-                    realtime_urgency_active: parseInt(configs.realtime_urgency_active) || 5,
-                    realtime_urgency_idle:   parseInt(configs.realtime_urgency_idle)   || 7,
-                    realtime_enabled:       configs.realtime_enabled !== 'false',
-                },
-                ai_provider: provider,
-                api_key: configs[`${provider}_api_key`] || process.env.GEMINI_API_KEY || '',
-                model: configs[`${provider}_model`] || 'gemini-2.0-flash',
-                system_prompt: configs[`${provider}_system_prompt`] || '',
-                ai_prefix: configs.ai_prefix || '',
-                ai_bot_enabled: configs.ai_bot_enabled === 'true',
-                red_instance_id: configs.red_instance_id || '',
-                red_proxy_url: configs.red_proxy_url || ''
-            }
-        } else {
-            configData = {
-                tenant_id: tenantId,
-                chat: {
-                    provider: d.chat_provider || d.ai_provider || 'gemini',
-                    api_key: d.chat_api_key || d.api_key || '',
-                    model: d.chat_model || d.model || '',
-                    system_prompt: d.system_prompt || '',
-                    red_instance_id: d.red_instance_id || '',
-                    red_proxy_url: d.red_proxy_url || 'ws://automais.ddns.net:11434'
-                },
-                stt: {
-                    provider: d.stt_provider || 'groq',
-                    api_key: d.stt_api_key || d.api_key || '',
-                    model: d.stt_model || 'whisper-large-v3-turbo',
-                    enabled: d.stt_enabled !== false && d.stt_enabled !== 'false'
-                },
-                vision: {
-                    provider: d.vision_provider || 'gemini',
-                    api_key: d.vision_api_key || d.api_key || '',
-                    model: d.vision_model || 'gemini-2.0-flash',
-                    enabled: d.vision_enabled !== false
-                },
-                tts: {
-                    provider: d.tts_provider || 'edge',
-                    api_key: d.tts_api_key || '',
-                    model: d.tts_model || '',
-                    voice_id: d.tts_voice_id || 'pt-BR-FranciscaNeural',
-                    enabled: d.tts_enabled === true || d.tts_enabled === 'true',
-                    audio_probability: parseFloat(d.tts_audio_probability) || 0.3,
-                    rate: d.tts_rate || '-5%',
-                    pitch: d.tts_pitch || '+0Hz',
-                    volume: d.tts_volume || '+0%'
-                },
-                learning: {
-                    provider: d.learning_provider || d.ai_provider || 'gemini',
-                    api_key: d.learning_api_key || d.api_key || '',
-                    model: d.learning_model || d.model || 'gemini-2.0-flash',
-                    enabled: d.learning_enabled !== false
-                },
-                proactive: {
-                    enabled: d.proactive_enabled !== false,
-                    frequency: parseFloat(d.proactive_frequency) || 0.15,
-                    provider: d.proactive_provider || d.ai_provider || 'gemini',
-                    api_key: d.proactive_api_key || d.api_key || '',
-                    model: d.proactive_model || d.model || '',
-                    buffer_size:            parseInt(d.buffer_size)            || DEFAULT_BUFFER_SIZE,
-                    proactive_cooldown_ms:  parseInt(d.proactive_cooldown_ms)  || DEFAULT_PROACTIVE_COOLDOWN,
-                    realtime_cooldown_ms:   parseInt(d.realtime_cooldown_ms)   || DEFAULT_REALTIME_COOLDOWN,
-                    activity_window_ms:     parseInt(d.activity_window_ms)     || DEFAULT_ACTIVITY_WINDOW_MS,
-                    active_group_thresh:    parseInt(d.active_group_thresh)    || DEFAULT_ACTIVE_THRESH,
-                    realtime_urgency_active: parseInt(d.realtime_urgency_active) || 5,
-                    realtime_urgency_idle:   parseInt(d.realtime_urgency_idle)   || 7,
-                    realtime_enabled:       d.realtime_enabled !== false,
-                },
-                ai_provider: d.ai_provider || 'gemini',
-                api_key: d.api_key || '',
-                model: d.model || '',
-                system_prompt: d.system_prompt || '',
-                ai_prefix: d.ai_prefix || '',
-                ai_bot_enabled: d.ai_enabled === true,
-                red_instance_id: d.red_instance_id || '',
-                red_proxy_url: d.red_proxy_url || ''
-            }
+            stt: {
+                provider: stt.provider || 'groq',
+                api_key:  stt.api_key  || process.env.GROQ_API_KEY || '',
+                model:    stt.model    || 'whisper-large-v3-turbo',
+                enabled:  stt.enabled !== false && stt.enabled !== 'false'
+            },
+
+            vision: {
+                provider: vision.provider || 'gemini',
+                api_key:  vision.api_key  || process.env.GEMINI_API_KEY || '',
+                model:    vision.model    || 'gemini-2.0-flash',
+                enabled:  vision.enabled !== false && vision.enabled !== 'false'
+            },
+
+            tts: {
+                provider:         tts.provider         || 'edge',
+                api_key:          tts.api_key          || '',
+                model:            tts.model            || '',
+                voice_id:         tts.voice_id         || 'pt-BR-AntonioNeural',
+                enabled:          tts.enabled === true  || tts.enabled === 'true',
+                audio_probability: parseFloat(tts.audio_probability) || 0.25,
+                rate:             tts.rate   || '-5%',
+                pitch:            tts.pitch  || '+0Hz',
+                volume:           tts.volume || '+0%'
+            },
+
+            learning: {
+                provider: learning.provider || 'groq',
+                api_key:  learning.api_key  || process.env.GROQ_API_KEY || '',
+                model:    learning.model    || 'llama-3.1-8b-instant',
+                enabled:  learning.enabled !== false && learning.enabled !== 'false'
+            },
+
+            proactive: {
+                enabled:   proactive.enabled !== false && proactive.enabled !== 'false',
+                frequency: parseFloat(proactive.frequency) || 0.15,
+                provider:  proactive.provider || learning.provider || 'groq',
+                api_key:   proactive.api_key  || learning.api_key  || process.env.GROQ_API_KEY || '',
+                model:     proactive.model    || learning.model    || 'llama-3.1-8b-instant',
+
+                buffer_size:             parseInt(proactive.buffer_size)             || DEFAULT_BUFFER_SIZE,
+                proactive_cooldown_ms:   parseInt(proactive.proactive_cooldown_ms)   || DEFAULT_PROACTIVE_COOLDOWN,
+                realtime_cooldown_ms:    parseInt(proactive.realtime_cooldown_ms)    || DEFAULT_REALTIME_COOLDOWN,
+                activity_window_ms:      parseInt(proactive.activity_window_ms)      || DEFAULT_ACTIVITY_WINDOW_MS,
+                active_group_thresh:     parseInt(proactive.active_group_thresh)     || DEFAULT_ACTIVE_THRESH,
+                realtime_urgency_active: parseInt(proactive.realtime_urgency_active) || 5,
+                realtime_urgency_idle:   parseInt(proactive.realtime_urgency_idle)   || 7,
+                realtime_enabled:        proactive.realtime_enabled !== false && proactive.realtime_enabled !== 'false'
+            },
+
+            // Campos legados — mantidos pra compatibilidade interna
+            ai_provider:    chat.provider   || 'groq',
+            api_key:        chat.api_key    || process.env.GROQ_API_KEY || '',
+            model:          chat.model      || 'llama-3.3-70b-versatile',
+            system_prompt:  chat.system_prompt || '',
+            ai_prefix:      d.ai_prefix     || '',
+            ai_bot_enabled: d.ai_bot_enabled !== false && d.ai_bot_enabled !== 'false',
+            red_instance_id: chat.red_instance_id || d.red_instance_id || '',
+            red_proxy_url:  d.red_proxy_url || 'ws://automais.ddns.net:11434'
         }
 
         const session = sessions.get(tenantId)
@@ -1479,14 +1412,18 @@ async function loadTenantAIConfigs(tenantId) {
             session.aiConfigs = configData
             const isRed = !!configData.chat?.red_instance_id
             const chatLabel = isRed
-                ? `RED Claude (análise → ${configData.chat?.provider || 'gemini'})`
-                : `${configData.chat?.provider || 'gemini'}/${configData.chat?.model || '?'}`
-            console.log(`✅ Configs [${tenantId}] Chat: ${chatLabel}`)
+                ? `RED Claude (proxy)`
+                : `${configData.chat.provider}/${configData.chat.model}`
+            console.log(`✅ Configs [${tenantId}] Chat:${chatLabel} | STT:${configData.stt.provider} | Vision:${configData.vision.provider} | Learn:${configData.learning.provider} | Pro:${configData.proactive.provider}`)
         }
     } catch (err) {
         console.error(`Erro ao carregar configs [${tenantId}]:`, err?.message)
         const session = sessions.get(tenantId)
-        if (session) session.aiConfigs = { chat: { provider: 'gemini', api_key: process.env.GEMINI_API_KEY || '', model: 'gemini-2.0-flash', system_prompt: 'Você é um assistente.' }, stt: { enabled: false }, vision: { enabled: false }, tts: { enabled: false }, learning: { enabled: false }, proactive: { enabled: false }, ai_bot_enabled: false }
+        if (session) session.aiConfigs = {
+            chat: { provider: 'groq', api_key: process.env.GROQ_API_KEY || '', model: 'llama-3.3-70b-versatile', system_prompt: 'Você é um assistente.' },
+            stt: { enabled: false }, vision: { enabled: false }, tts: { enabled: false },
+            learning: { enabled: false }, proactive: { enabled: false }, ai_bot_enabled: false
+        }
     }
 }
 
@@ -1899,7 +1836,7 @@ async function connectToWhatsApp(tenantId, forceReset = false) {
 
             try {
                 const liveStateKey = streamStateKey(tenantId, remoteJid)
-                const aiSessionId = `WA_${tenantId || 'default'}`
+                const aiSessionId = `WA_${tenantId || 'default'}_${msg.key.id || Date.now()}`
 
                 // Reação 🧠 indica que estou processando
                 try { await sock.sendMessage(remoteJid, { react: { text: '🧠', key: msg.key } }) } catch (_) {}
@@ -1971,6 +1908,92 @@ app.get('/groups',   (_, res) => res.redirect('/groups/admin'))
 app.post('/send',    (_, res) => res.redirect(307, '/send/admin'))
 app.post('/reset',   (_, res) => res.redirect(307, '/reset/admin'))
 app.post('/ai/reload', async (_, res) => { await loadTenantAIConfigs(ADMIN_TENANT_ID); res.json({ success: true }) })
+
+// Recarrega o ai_config.json em runtime sem reiniciar o serviço
+app.post('/ai/config/reload', (_, res) => {
+    _aiConfigCache = null
+    _aiConfigMtime = 0
+    const cfg = loadAIConfigFile()
+    // Recarrega configs de todas as sessões ativas
+    for (const [tid] of sessions) {
+        loadTenantAIConfigs(tid).catch(() => {})
+    }
+    res.json({ success: true, tenants: Object.keys(cfg) })
+})
+
+// Salva config de um tenant específico no JSON (chamado pelo dashboard)
+app.put('/ai/config/:tenantId', (req, res) => {
+    try {
+        const { tenantId } = req.params
+        const body = req.body || {}
+
+        // Lê o arquivo atual
+        let cfg = {}
+        try {
+            const raw = fs.readFileSync(AI_CONFIG_PATH, 'utf8')
+            cfg = JSON.parse(raw)
+        } catch (_) {}
+
+        // Mescla com o que já existe para não sobrescrever campos não enviados
+        const existing = cfg[tenantId] || cfg['admin'] || {}
+
+        const mergeSection = (existingSection, newSection) => {
+            if (!newSection || typeof newSection !== 'object') return existingSection
+            return { ...existingSection, ...newSection }
+        }
+
+        cfg[tenantId] = {
+            ...existing,
+            ai_bot_enabled: body.ai_enabled ?? body.ai_bot_enabled ?? existing.ai_bot_enabled ?? true,
+            ai_prefix:      body.ai_prefix ?? existing.ai_prefix ?? '',
+            red_instance_id: body.red_instance_id ?? existing.red_instance_id ?? '',
+            red_proxy_url:  body.red_proxy_url ?? existing.red_proxy_url ?? 'ws://automais.ddns.net:11434',
+
+            chat: mergeSection(existing.chat || {}, body.chat || {
+                provider:      body.ai_provider  ?? existing.chat?.provider,
+                api_key:       body.api_key       ?? existing.chat?.api_key,
+                model:         body.model         ?? existing.chat?.model,
+                system_prompt: body.system_prompt ?? existing.chat?.system_prompt,
+                red_instance_id: body.red_instance_id ?? existing.chat?.red_instance_id,
+            }),
+
+            stt:      mergeSection(existing.stt      || {}, body.stt      || {}),
+            vision:   mergeSection(existing.vision   || {}, body.vision   || {}),
+            tts:      mergeSection(existing.tts      || {}, body.tts      || {}),
+            learning: mergeSection(existing.learning || {}, body.learning || {}),
+            proactive:mergeSection(existing.proactive|| {}, body.proactive|| {}),
+        }
+
+        // Persiste no disco
+        fs.writeFileSync(AI_CONFIG_PATH, JSON.stringify(cfg, null, 2), 'utf8')
+
+        // Invalida cache e recarrega
+        _aiConfigCache = null
+        _aiConfigMtime = 0
+        loadTenantAIConfigs(tenantId).catch(() => {})
+
+        console.log(`[CONFIG] ✅ Tenant "${tenantId}" atualizado via dashboard`)
+        res.json({ success: true })
+    } catch (err) {
+        console.error('[CONFIG] Erro ao salvar:', err.message)
+        res.status(500).json({ success: false, error: err.message })
+    }
+})
+
+// Retorna a config atual em memória (útil pra debug)
+app.get('/ai/config', (_, res) => {
+    const cfg = loadAIConfigFile()
+    // Remove api_keys por segurança
+    const safe = JSON.parse(JSON.stringify(cfg))
+    for (const t of Object.values(safe)) {
+        for (const section of Object.values(t)) {
+            if (section && typeof section === 'object' && section.api_key) {
+                section.api_key = section.api_key ? '***' : ''
+            }
+        }
+    }
+    res.json(safe)
+})
 
 app.get('/status/:tenantId', (req, res) => {
     const s = sessions.get(req.params.tenantId)

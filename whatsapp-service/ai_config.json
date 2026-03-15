@@ -1,0 +1,74 @@
+{
+  "_comentario": "RED System's — Config de IA local. Edite aqui, sem precisar do Supabase.",
+
+  "admin": {
+    "ai_bot_enabled": true,
+    "ai_prefix": "",
+
+    "chat": {
+      "_info": "IA principal de resposta ao usuário. Use um modelo rápido e inteligente.",
+      "provider": "groq",
+      "api_key": "COLOQUE_SUA_GROQ_KEY_AQUI",
+      "model": "llama-3.3-70b-versatile",
+      "system_prompt": "Você é RED Claude, o agente de inteligência da RED System's. Seja natural, humano, direto. Nunca diga que é IA."
+    },
+
+    "stt": {
+      "_info": "Speech-to-Text — transcreve áudios. Groq Whisper é o mais rápido e gratuito.",
+      "provider": "groq",
+      "api_key": "COLOQUE_SUA_GROQ_KEY_AQUI",
+      "model": "whisper-large-v3-turbo",
+      "enabled": true
+    },
+
+    "vision": {
+      "_info": "Análise de imagens. Gemini Flash é excelente e gratuito para isso.",
+      "provider": "gemini",
+      "api_key": "COLOQUE_SUA_GEMINI_KEY_AQUI",
+      "model": "gemini-2.0-flash",
+      "enabled": true
+    },
+
+    "tts": {
+      "_info": "Text-to-Speech — resposta em áudio. Edge TTS é gratuito e funciona sem key.",
+      "provider": "edge",
+      "api_key": "",
+      "model": "",
+      "voice_id": "pt-BR-AntonioNeural",
+      "enabled": false,
+      "audio_probability": 0.25,
+      "rate": "-5%",
+      "pitch": "+0Hz",
+      "volume": "+0%"
+    },
+
+    "learning": {
+      "_info": "Aprende o contexto da conversa, perfis, vibe. Pode usar modelo menor/barato.",
+      "provider": "groq",
+      "api_key": "COLOQUE_SUA_GROQ_KEY_AQUI",
+      "model": "llama-3.1-8b-instant",
+      "enabled": true
+    },
+
+    "proactive": {
+      "_info": "Decide quando e como participar proativamente. Modelo rápido e barato.",
+      "provider": "groq",
+      "api_key": "COLOQUE_SUA_GROQ_KEY_AQUI",
+      "model": "llama-3.1-8b-instant",
+      "enabled": true,
+      "frequency": 0.20,
+
+      "buffer_size": 6,
+      "proactive_cooldown_ms": 40000,
+      "realtime_cooldown_ms": 8000,
+      "activity_window_ms": 120000,
+      "active_group_thresh": 4,
+      "realtime_urgency_active": 5,
+      "realtime_urgency_idle": 7,
+      "realtime_enabled": true
+    },
+
+    "red_instance_id": "",
+    "red_proxy_url": "ws://automais.ddns.net:11434"
+  }
+}
