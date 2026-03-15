@@ -495,8 +495,10 @@ async function getAIResponse(prompt, configs, overrideSystemPrompt = null) {
                 return resolve(null);
             }
 
+            let finished = false
             const responseHandler = (data) => {
                 if (data.action === 'NEURAL_COMPLETE' && data.sessionId === sessionId) {
+                    finished = true
                     eventEmitter.off('proxy_message', responseHandler);
                     resolve(data.text);
                 }
@@ -513,8 +515,19 @@ async function getAIResponse(prompt, configs, overrideSystemPrompt = null) {
                 sessionId: sessionId
             }));
 
+            setTimeout(() => {
+                if (finished) return
+                console.warn(`[AI] Instância ${instanceId} não respondeu a tempo. Tentando fallback sem instanceId...`)
+                proxySocket.send(JSON.stringify({
+                    action: "START_NEURAL_LINK",
+                    text: proxyText,
+                    sessionId: sessionId
+                }));
+            }, 4000)
+
             // Timeout de 90 segundos para o Claude responder
             setTimeout(() => {
+                if (finished) return
                 eventEmitter.off('proxy_message', responseHandler);
                 resolve(null);
             }, 90000);
