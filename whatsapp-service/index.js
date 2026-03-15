@@ -435,15 +435,37 @@ async function sendSticker(sock, remoteJid, mood) {
 // ══════════════════════════════════════════════════
 async function humanDelay(ms) { return new Promise(r => setTimeout(r, ms)) }
 
+function formatForWhatsApp(text) {
+    if (!text) return ''
+    let t = String(text)
+    t = t.replace(/<br\s*\/?>/gi, '\n')
+    t = t.replace(/<\/p>\s*<p>/gi, '\n\n')
+    t = t.replace(/<p[^>]*>/gi, '')
+    t = t.replace(/<\/p>/gi, '')
+    t = t.replace(/<li[^>]*>\s*/gi, '• ')
+    t = t.replace(/<\/li>/gi, '\n')
+    t = t.replace(/<strong[^>]*>([\s\S]*?)<\/strong>/gi, '*$1*')
+    t = t.replace(/<b[^>]*>([\s\S]*?)<\/b>/gi, '*$1*')
+    t = t.replace(/<em[^>]*>([\s\S]*?)<\/em>/gi, '_$1_')
+    t = t.replace(/<i[^>]*>([\s\S]*?)<\/i>/gi, '_$1_')
+    t = t.replace(/<code[^>]*>([\s\S]*?)<\/code>/gi, '```$1```')
+    t = t.replace(/<[^>]+>/g, '')
+    t = t.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '$1 ($2)')
+    t = t.replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    t = t.replace(/\n{3,}/g, '\n\n')
+    return t.trim()
+}
+
 async function sendSmartResponse(sock, remoteJid, text, quotedMsg, configs, extraOpts = {}) {
+    const waText = formatForWhatsApp(text)
     const ttsCfg = configs.tts || {}
     const ttsEnabled = ttsCfg.enabled === true || ttsCfg.enabled === 'true'
     const shouldSendAudio = ttsEnabled && Math.random() < (parseFloat(ttsCfg.audio_probability) || 0.3)
 
-    if (shouldSendAudio && text.length < 500) {
+    if (shouldSendAudio && waText.length < 500) {
         try {
             await sock.sendPresenceUpdate('recording', remoteJid)
-            const audioBuffer = await generateAudio(text, configs)
+            const audioBuffer = await generateAudio(waText, configs)
             if (audioBuffer) {
                 await humanDelay(800 + Math.random() * 1200)
                 await sock.sendPresenceUpdate('available', remoteJid)
@@ -458,11 +480,11 @@ async function sendSmartResponse(sock, remoteJid, text, quotedMsg, configs, extr
     // Typing indicator proporcional ao texto
     try {
         await sock.sendPresenceUpdate('composing', remoteJid)
-        await humanDelay(Math.min(4000, Math.max(800, text.length * 30)))
+        await humanDelay(Math.min(4000, Math.max(800, waText.length * 30)))
         await sock.sendPresenceUpdate('available', remoteJid)
     } catch (_) {}
 
-    await sock.sendMessage(remoteJid, { text }, { quoted: quotedMsg })
+    await sock.sendMessage(remoteJid, { text: waText }, { quoted: quotedMsg })
 }
 
 // ══════════════════════════════════════════════════
@@ -487,7 +509,7 @@ async function getAIResponse(prompt, configs, overrideSystemPrompt = null) {
             return null;
         }
 
-        const sessionId = `WA_${configs.tenant_id || 'default'}_${Math.random().toString(36).substring(7)}`;
+        const sessionId = `WA_${configs.tenant_id || 'default'}`;
         
         return new Promise((resolve) => {
             if (!proxySocket || proxySocket.readyState !== WebSocket.OPEN) {
@@ -496,7 +518,11 @@ async function getAIResponse(prompt, configs, overrideSystemPrompt = null) {
             }
 
             let finished = false
+            let gotActivity = false
             const responseHandler = (data) => {
+                if ((data.action === 'NEURAL_STREAM' || data.action === 'NEURAL_COMPLETE') && data.sessionId === sessionId) {
+                    gotActivity = true
+                }
                 if (data.action === 'NEURAL_COMPLETE' && data.sessionId === sessionId) {
                     finished = true
                     eventEmitter.off('proxy_message', responseHandler);
@@ -526,13 +552,14 @@ async function getAIResponse(prompt, configs, overrideSystemPrompt = null) {
 
             setTimeout(() => {
                 if (finished) return
+                if (gotActivity) return
                 console.warn(`[AI] Instância ${instanceId} não respondeu a tempo. Tentando fallback sem instanceId...`)
                 proxySocket.send(JSON.stringify({
                     action: "START_NEURAL_LINK",
                     text: proxyText,
                     sessionId: sessionId
                 }));
-            }, 4000)
+            }, 12000)
 
             // Timeout de 90 segundos para o Claude responder
             setTimeout(() => {
@@ -1311,9 +1338,10 @@ async function connectToWhatsApp(tenantId, forceReset = false) {
         keepAliveIntervalMs: 25000
     })
 
-    const session = { sock, aiConfigs: null, lastQr: null, status: 'connecting' }
+    const session = { sock, aiConfigs: null, lastQr: null, status: 'connecting', lastConfigRefresh: 0 }
     sessions.set(tenantId, session)
     await loadTenantAIConfigs(tenantId)
+    session.lastConfigRefresh = Date.now()
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update
@@ -1401,6 +1429,10 @@ async function connectToWhatsApp(tenantId, forceReset = false) {
                 (botLidShort && contextInfo?.participant?.includes(botLidShort))
             )
 
+            if ((Date.now() - (session.lastConfigRefresh || 0)) > 10000) {
+                await loadTenantAIConfigs(tenantId)
+                session.lastConfigRefresh = Date.now()
+            }
             const configs    = session.aiConfigs || {}
             const isBotEnabled = String(configs.ai_bot_enabled) === 'true'
 
