@@ -469,24 +469,25 @@ async function sendSmartResponse(sock, remoteJid, text, quotedMsg, configs, extr
 // CORE IA — Geração de Resposta
 // ══════════════════════════════════════════════════
 async function getAIResponse(prompt, configs, overrideSystemPrompt = null) {
+    // DEBUG: Mostra exatamente o que está chegando nas configs
+    console.log("[AI-DEBUG] Configs recebidas:", JSON.stringify(configs, null, 2));
+
     const chatCfg = configs.chat || {}
     const provider = chatCfg.provider || configs.ai_provider || 'gemini'
     const apiKey = chatCfg.api_key || configs.api_key || ''
     const model = chatCfg.model || configs.model || ''
     const systemPrompt = overrideSystemPrompt || chatCfg.system_prompt || configs.system_prompt || 'Você é um assistente.'
 
-    if (provider !== 'red-claude' && (!apiKey || !model)) { 
-        console.warn(`[AI] Config incompleta (${provider})`); 
-        return null 
-    }
-
-    try {
-        if (provider === 'red-claude') {
-            const instanceId = chatCfg.red_instance_id || configs.red_instance_id || configs.chat?.red_instance_id;
-            if (!instanceId) {
-                console.error(`[AI] RED Claude selecionado para ${configs.tenant_id}, mas red_instance_id não configurado.`);
-                return null;
-            }
+    if (provider === 'red-claude') {
+        const instanceId = chatCfg.red_instance_id || configs.red_instance_id || configs.red_instance_id;
+        
+        if (!instanceId) {
+            console.error(`[AI] RED Claude selecionado para ${configs.tenant_id || 'unknown'}, mas red_instance_id não encontrado em:`, {
+                chat_red_id: chatCfg.red_instance_id,
+                root_red_id: configs.red_instance_id
+            });
+            return null;
+        }
 
             const sessionId = `WA_${configs.tenant_id || 'default'}_${Math.random().toString(36).substring(7)}`;
             
