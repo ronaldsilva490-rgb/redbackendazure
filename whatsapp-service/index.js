@@ -1014,6 +1014,8 @@ async function loadTenantAIConfigs(tenantId) {
                 })
             }
 
+            // PRIORIDADE: Se existe config no painel de WhatsApp, usa o prompt de lá (mesmo que vazio).
+            const hasTenantConfig = !!tenantDataArr?.[0]
             const provider = d.ai_provider || configs.ai_provider || 'gemini'
 
             configData = {
@@ -1022,7 +1024,7 @@ async function loadTenantAIConfigs(tenantId) {
                     provider: d.chat_provider || d.ai_provider || configs.chat_provider || provider,
                     api_key: d.chat_api_key || d.api_key || configs[`${configs.chat_provider || provider}_api_key`] || configs[`${provider}_api_key`] || process.env.GEMINI_API_KEY || '',
                     model: d.chat_model || d.model || configs.chat_model || configs[`${provider}_model`] || 'gemini-2.0-flash',
-                    system_prompt: d.system_prompt || configs.chat_system_prompt || configs[`${provider}_system_prompt`] || '',
+                    system_prompt: hasTenantConfig ? (d.system_prompt || '') : (d.system_prompt || configs.chat_system_prompt || configs[`${provider}_system_prompt`] || ''),
                     red_instance_id: d.red_instance_id || configs.red_instance_id || '',
                     red_proxy_url: d.red_proxy_url || configs.red_proxy_url || 'ws://automais.ddns.net:11434'
                 },
