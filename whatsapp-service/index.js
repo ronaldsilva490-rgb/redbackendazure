@@ -611,13 +611,20 @@ async function sendSmartResponse(sock, remoteJid, text, quotedMsg, configs, extr
     const ttsCfg = configs.tts || {}
     const ttsEnabled = ttsCfg.enabled === true || ttsCfg.enabled === 'true'
     const shouldSendAudio = ttsEnabled && Math.random() < (parseFloat(ttsCfg.audio_probability) || 0.3)
+    // skipPresence: true quando vem do fluxo RED Claude — realtime composing já gerenciou o presence
+    const skipPresence = !!extraOpts.skipPresence
+
+    // Remove reação de "pensando" antes de enviar a resposta
+    if (extraOpts.reactKey) {
+        try { await sock.sendMessage(remoteJid, { react: { text: '', key: extraOpts.reactKey } }) } catch (_) {}
+    }
 
     if (shouldSendAudio && waText.length < 500 && attachmentFiles.length === 0) {
         try {
-            await sock.sendPresenceUpdate('recording', remoteJid)
+            if (!skipPresence) await sock.sendPresenceUpdate('recording', remoteJid)
             const audioBuffer = await generateAudio(waText, configs)
             if (audioBuffer) {
-                await humanDelay(800 + Math.random() * 1200)
+                if (!skipPresence) await humanDelay(800 + Math.random() * 1200)
                 await sock.sendPresenceUpdate('available', remoteJid)
                 await sock.sendMessage(remoteJid, { audio: audioBuffer, mimetype: 'audio/ogg; codecs=opus', ptt: true }, { quoted: quotedMsg })
                 console.log(`[SEND] ✅ PTT → ${remoteJid}`)
@@ -627,12 +634,14 @@ async function sendSmartResponse(sock, remoteJid, text, quotedMsg, configs, extr
         } catch (_) {}
     }
 
-    // Typing indicator proporcional ao texto
-    try {
-        await sock.sendPresenceUpdate('composing', remoteJid)
-        await humanDelay(Math.min(4000, Math.max(800, waText.length * 30)))
-        await sock.sendPresenceUpdate('available', remoteJid)
-    } catch (_) {}
+    // Typing indicator — só quando NÃO vem do fluxo RED Claude
+    if (!skipPresence) {
+        try {
+            await sock.sendPresenceUpdate('composing', remoteJid)
+            await humanDelay(Math.min(2000, Math.max(400, waText.length * 15)))
+            await sock.sendPresenceUpdate('available', remoteJid)
+        } catch (_) {}
+    }
 
     if (attachmentFiles.length) {
         const sentWithCaption = await sendRemoteFilesToWhatsApp(sock, remoteJid, attachmentFiles, quotedMsg, waText)
@@ -1880,6 +1889,10 @@ async function connectToWhatsApp(tenantId, forceReset = false) {
             try {
                 const liveStateKey = streamStateKey(tenantId, remoteJid)
                 const aiSessionId = `WA_${tenantId || 'default'}`
+
+                // Reação 🧠 indica que estou processando
+                try { await sock.sendMessage(remoteJid, { react: { text: '🧠', key: msg.key } }) } catch (_) {}
+
                 waSessionDispatchState.set(aiSessionId, {
                     sock,
                     remoteJid,
@@ -1898,6 +1911,9 @@ async function connectToWhatsApp(tenantId, forceReset = false) {
                     state.updatedAt = Date.now()
                 }
                 if (response || files.length) {
+                    // Para o "digitando" ANTES de enviar — evita o bug de typing travado
+                    await stopRealtimeComposing(sock, remoteJid, liveStateKey)
+
                     // Às vezes envia sticker junto (só em grupos animados)
                     if (isGroup && isActiveGroup && Math.random() < 0.08) {
                         const mood = currentVibe.toLowerCase().includes('zoeira') ? 'laugh'
@@ -1907,7 +1923,11 @@ async function connectToWhatsApp(tenantId, forceReset = false) {
                             await humanDelay(600 + Math.random() * 800)
                         }
                     }
-                    await sendSmartResponse(sock, remoteJid, response || '📎 Arquivo gerado.', msg, configs, { files })
+                    await sendSmartResponse(sock, remoteJid, response || '📎 Arquivo gerado.', msg, configs, {
+                        files,
+                        skipPresence: true,
+                        reactKey: msg.key
+                    })
                 } else {
                     if (isPV) await sock.sendMessage(remoteJid, { text: 'Sem conexão com o modelo agora, tenta de novo!' }, { quoted: msg })
                 }
@@ -1918,9 +1938,10 @@ async function connectToWhatsApp(tenantId, forceReset = false) {
                         waSessionDispatchState.delete(aiSessionId)
                     }
                 }, 185000)
-                await stopRealtimeComposing(sock, remoteJid, liveStateKey)
+                // stopRealtimeComposing já foi chamado antes do sendSmartResponse
             } catch (err) {
                 await stopRealtimeComposing(sock, remoteJid, streamStateKey(tenantId, remoteJid))
+                try { await sock.sendMessage(remoteJid, { react: { text: '', key: msg.key } }) } catch (_) {}
                 console.error(`[RESP] Erro:`, err.message)
                 if (isPV) await sock.sendMessage(remoteJid, { text: 'Erro interno. Tenta de novo!' }, { quoted: msg })
             }
