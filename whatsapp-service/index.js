@@ -500,7 +500,16 @@ async function getAIResponse(prompt, configs, overrideSystemPrompt = null) {
                 if (data.action === 'NEURAL_COMPLETE' && data.sessionId === sessionId) {
                     finished = true
                     eventEmitter.off('proxy_message', responseHandler);
-                    resolve(data.text);
+                    let text = typeof data.text === 'string' ? data.text : ''
+                    if (!text && data?.data?.chunks?.length) {
+                        text = data.data.chunks
+                            .filter(c => c?.type === 'text' && typeof c.content === 'string')
+                            .map(c => c.content.trim())
+                            .filter(Boolean)
+                            .join('\n')
+                            .trim()
+                    }
+                    resolve(text || null);
                 }
             };
 
