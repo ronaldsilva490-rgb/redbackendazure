@@ -985,7 +985,7 @@ async function loadTenantAIConfigs(tenantId) {
 
         if (isAdmin) {
             const { data: globalData, error } = await supabase.from('ai_configs').select('*')
-            const { data: tenantData } = await supabase.from('whatsapp_tenant_configs').select('*').eq('tenant_id', 'admin').maybe_single()
+            const { data: tenantDataArr } = await supabase.from('whatsapp_tenant_configs').select('*').eq('tenant_id', 'admin').limit(1)
             
             const configs = {}
             if (!error && globalData) {
@@ -995,7 +995,7 @@ async function loadTenantAIConfigs(tenantId) {
             }
 
             // Prioriza o que está na tabela de integração (onde o dashboard salva)
-            const d = tenantData || {}
+            const d = tenantDataArr?.[0] || {}
             const provider = d.ai_provider || configs.ai_provider || 'gemini'
 
             configData = {
