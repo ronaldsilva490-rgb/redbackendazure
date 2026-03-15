@@ -70,7 +70,6 @@ const ADMIN_TENANT_ID = process.env.ADMIN_TENANT_ID || 'admin'
 const sessions = new Map()
 const conversationBuffers = new Map()
 const waSessionDispatchState = new Map()
-const activeSessionListeners = new Set() // Previne listeners duplicados por sessionId
 
 // ── Controle de proatividade e atividade por conversa ──
 const lastProactiveTime     = new Map() // tenantId_jid → timestamp último proativo
@@ -623,14 +622,11 @@ async function sendSmartResponse(sock, remoteJid, text, quotedMsg, configs, extr
     }
 
     // Typing indicator proporcional ao texto
-    // Só envia composing se não veio de uma sessão realtime (que já gerenciou o presence)
-    if (!extraOpts.skipPresence) {
-        try {
-            await sock.sendPresenceUpdate('composing', remoteJid)
-            await humanDelay(Math.min(4000, Math.max(800, waText.length * 30)))
-            await sock.sendPresenceUpdate('available', remoteJid)
-        } catch (_) {}
-    }
+    try {
+        await sock.sendPresenceUpdate('composing', remoteJid)
+        await humanDelay(Math.min(4000, Math.max(800, waText.length * 30)))
+        await sock.sendPresenceUpdate('available', remoteJid)
+    } catch (_) {}
 
     if (attachmentFiles.length) {
         const sentWithCaption = await sendRemoteFilesToWhatsApp(sock, remoteJid, attachmentFiles, quotedMsg, waText)
@@ -733,9 +729,15 @@ eventEmitter.on('proxy_message', (data) => {
 async function getAIResponse(prompt, configs, overrideSystemPrompt = null, options = {}) {
     const chatCfg = configs.chat || {}
     
-    // FORÇAR RED-CLAUDE SE HOUVER INSTANCE ID
+    // Chamadas internas de análise JSON não devem passar pelo RED Claude —
+    // são mais rápidas e confiáveis num provider direto como Groq/Gemini
+    const isInternalAnalysis = !!(overrideSystemPrompt && (
+        overrideSystemPrompt.includes('JSON') ||
+        overrideSystemPrompt.includes('Analista interno')
+    ))
+
     const instanceId = chatCfg.red_instance_id || configs.red_instance_id;
-    const isRedClaudeForced = !!instanceId;
+    const isRedClaudeForced = !!instanceId && !isInternalAnalysis;
     
     const provider = isRedClaudeForced ? 'red-claude' : (chatCfg.provider || configs.ai_provider || 'gemini');
     
@@ -757,13 +759,6 @@ async function getAIResponse(prompt, configs, overrideSystemPrompt = null, optio
                 return resolve(null);
             }
 
-            // Garante que só existe UM listener por sessionId — evita mensagem dupla
-            if (activeSessionListeners.has(sessionId)) {
-                console.warn(`[AI] Listener já ativo para ${sessionId}, aguardando...`)
-                return resolve(null)
-            }
-            activeSessionListeners.add(sessionId)
-
             let finished = false
             const responseHandler = (data) => {
                 if ((data.action === 'NEURAL_STREAM' || data.action === 'NEURAL_COMPLETE') && data.sessionId === sessionId) {
@@ -774,7 +769,6 @@ async function getAIResponse(prompt, configs, overrideSystemPrompt = null, optio
                 if (data.action === 'NEURAL_COMPLETE' && data.sessionId === sessionId) {
                     finished = true
                     eventEmitter.off('proxy_message', responseHandler);
-                    activeSessionListeners.delete(sessionId)
                     let text = typeof data.text === 'string' ? data.text : ''
                     let files = []
                     if (Array.isArray(data.files)) {
@@ -817,7 +811,6 @@ async function getAIResponse(prompt, configs, overrideSystemPrompt = null, optio
             setTimeout(() => {
                 if (finished) return
                 eventEmitter.off('proxy_message', responseHandler);
-                activeSessionListeners.delete(sessionId)
                 resolve(null);
             }, 180000);
         });
@@ -1458,8 +1451,11 @@ async function loadTenantAIConfigs(tenantId) {
         const session = sessions.get(tenantId)
         if (session) {
             session.aiConfigs = configData
-            const instanceLog = configData.chat?.red_instance_id ? ` (ID: ${configData.chat.red_instance_id})` : ''
-            console.log(`✅ Configs [${tenantId}] Chat: ${configData.chat?.provider}${instanceLog}/${configData.chat?.model}`)
+            const isRed = !!configData.chat?.red_instance_id
+            const chatLabel = isRed
+                ? `RED Claude (análise → ${configData.chat?.provider || 'gemini'})`
+                : `${configData.chat?.provider || 'gemini'}/${configData.chat?.model || '?'}`
+            console.log(`✅ Configs [${tenantId}] Chat: ${chatLabel}`)
         }
     } catch (err) {
         console.error(`Erro ao carregar configs [${tenantId}]:`, err?.message)
@@ -1890,7 +1886,7 @@ async function connectToWhatsApp(tenantId, forceReset = false) {
                             await humanDelay(600 + Math.random() * 800)
                         }
                     }
-                    await sendSmartResponse(sock, remoteJid, response || '📎 Arquivo gerado.', msg, configs, { files, skipPresence: true })
+                    await sendSmartResponse(sock, remoteJid, response || '📎 Arquivo gerado.', msg, configs, { files })
                 } else {
                     if (isPV) await sock.sendMessage(remoteJid, { text: 'Sem conexão com o modelo agora, tenta de novo!' }, { quoted: msg })
                 }
