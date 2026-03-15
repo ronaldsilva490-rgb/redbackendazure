@@ -434,6 +434,147 @@ async function sendSticker(sock, remoteJid, mood) {
 // ENVIO INTELIGENTE — typing/recording + fallback texto
 // ══════════════════════════════════════════════════
 async function humanDelay(ms) { return new Promise(r => setTimeout(r, ms)) }
+const realtimeStreamState = new Map()
+const STREAM_PRESENCE_REFRESH_MS = 4000
+const STREAM_PRESENCE_IDLE_MS = 18000
+const STREAM_STATE_RETENTION_MS = 120000
+
+function streamStateKey(tenantId, remoteJid) {
+    return `${tenantId || 'default'}::${remoteJid || 'unknown'}`
+}
+
+function streamDataToText(streamData) {
+    if (!streamData?.chunks?.length) return ''
+    return streamData.chunks.map((c) => {
+        if (!c || typeof c !== 'object') return ''
+        if (c.type === 'text' && typeof c.content === 'string') {
+            return c.content.trim()
+        }
+        if (c.type === 'heading' && typeof c.content === 'string') {
+            return `*${c.content.trim()}*`
+        }
+        if (c.type === 'code' && typeof c.content === 'string') {
+            const lang = typeof c.language === 'string' && c.language.trim() ? c.language.trim() : ''
+            return lang ? `\`\`\`${lang}\n${c.content.trim()}\n\`\`\`` : `\`\`\`\n${c.content.trim()}\n\`\`\``
+        }
+        if (c.type === 'list' && Array.isArray(c.items)) {
+            return c.items
+                .map((item, idx) => c.listType === 'ol' ? `${idx + 1}. ${String(item).trim()}` : `• ${String(item).trim()}`)
+                .join('\n')
+                .trim()
+        }
+        return ''
+    }).filter(Boolean).join('\n\n').trim()
+}
+
+function touchRealtimeStreamBuffer(key, streamEvent) {
+    if (!key) return
+    const now = Date.now()
+    const current = realtimeStreamState.get(key) || {
+        text: '',
+        updates: 0,
+        startedAt: now,
+        lastEventAt: now,
+        composingLastTouch: 0,
+        composingInterval: null
+    }
+    const chunkText = streamDataToText(streamEvent?.data)
+    if (chunkText) current.text = chunkText
+    current.updates += 1
+    current.lastEventAt = now
+    current.composingLastTouch = now
+    realtimeStreamState.set(key, current)
+}
+
+function startRealtimeComposing(sock, remoteJid, key) {
+    if (!sock || !remoteJid || !key) return
+    const state = realtimeStreamState.get(key) || {
+        text: '',
+        updates: 0,
+        startedAt: Date.now(),
+        lastEventAt: Date.now(),
+        composingLastTouch: Date.now(),
+        composingInterval: null
+    }
+    state.composingLastTouch = Date.now()
+    const sendComposing = async () => {
+        try { await sock.sendPresenceUpdate('composing', remoteJid) } catch (_) {}
+    }
+    if (!state.composingInterval) {
+        sendComposing()
+        state.composingInterval = setInterval(() => {
+            const current = realtimeStreamState.get(key)
+            if (!current) return
+            if (Date.now() - (current.composingLastTouch || 0) > STREAM_PRESENCE_IDLE_MS) {
+                clearInterval(current.composingInterval)
+                current.composingInterval = null
+                return
+            }
+            sendComposing()
+        }, STREAM_PRESENCE_REFRESH_MS)
+    }
+    realtimeStreamState.set(key, state)
+}
+
+async function stopRealtimeComposing(sock, remoteJid, key) {
+    const state = realtimeStreamState.get(key)
+    if (!state) return
+    if (state.composingInterval) {
+        clearInterval(state.composingInterval)
+        state.composingInterval = null
+    }
+    try { await sock.sendPresenceUpdate('available', remoteJid) } catch (_) {}
+    const snapshot = { ...state }
+    setTimeout(() => {
+        const latest = realtimeStreamState.get(key)
+        if (!latest) return
+        if (latest.startedAt !== snapshot.startedAt) return
+        realtimeStreamState.delete(key)
+    }, STREAM_STATE_RETENTION_MS)
+}
+
+function handleRealtimeAIStreamEvent(sock, remoteJid, key, eventData) {
+    if (!eventData || !key) return
+    touchRealtimeStreamBuffer(key, eventData)
+    if (eventData.action === 'NEURAL_STREAM' || eventData.action === 'NEURAL_COMPLETE') {
+        startRealtimeComposing(sock, remoteJid, key)
+    }
+}
+
+function escapeRegExp(str) {
+    return String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function softenSourceReferences(text) {
+    const knownLabels = [
+        'Pravda em português',
+        'Folha de S.Paulo',
+        'BBC News Brasil',
+        'A Referência',
+        'CNN Brasil',
+        'Descomplica',
+        'Estadão',
+        'Reuters',
+        'Datafolha',
+        'UOL',
+        'G1'
+    ]
+    const sortedLabels = [...knownLabels].sort((a, b) => b.length - a.length)
+    return String(text)
+        .split('\n')
+        .map((rawLine) => {
+            let line = rawLine
+            for (const label of sortedLabels) {
+                const regex = new RegExp(`(\\s+)(${escapeRegExp(label)})\\s*$`, 'i')
+                const match = line.match(regex)
+                if (!match) continue
+                line = line.replace(regex, ` (_${match[2]}_)`)
+                break
+            }
+            return line
+        })
+        .join('\n')
+}
 
 function formatForWhatsApp(text) {
     if (!text) return ''
@@ -452,6 +593,7 @@ function formatForWhatsApp(text) {
     t = t.replace(/<[^>]+>/g, '')
     t = t.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '$1 ($2)')
     t = t.replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    t = softenSourceReferences(t)
     t = t.replace(/\n{3,}/g, '\n\n')
     return t.trim()
 }
@@ -570,6 +712,9 @@ async function getAIResponse(prompt, configs, overrideSystemPrompt = null, optio
             const responseHandler = (data) => {
                 if ((data.action === 'NEURAL_STREAM' || data.action === 'NEURAL_COMPLETE') && data.sessionId === sessionId) {
                     gotActivity = true
+                    if (typeof options?.onStream === 'function') {
+                        try { options.onStream(data) } catch (_) {}
+                    }
                 }
                 if (data.action === 'NEURAL_COMPLETE' && data.sessionId === sessionId) {
                     finished = true
@@ -587,26 +732,7 @@ async function getAIResponse(prompt, configs, overrideSystemPrompt = null, optio
                             }))
                     }
                     if (!text && data?.data?.chunks?.length) {
-                        text = data.data.chunks.map((c) => {
-                            if (!c || typeof c !== 'object') return ''
-                            if (c.type === 'text' && typeof c.content === 'string') {
-                                return c.content.trim()
-                            }
-                            if (c.type === 'heading' && typeof c.content === 'string') {
-                                return `*${c.content.trim()}*`
-                            }
-                            if (c.type === 'code' && typeof c.content === 'string') {
-                                const lang = typeof c.language === 'string' && c.language.trim() ? c.language.trim() : ''
-                                return lang ? `\`\`\`${lang}\n${c.content.trim()}\n\`\`\`` : `\`\`\`\n${c.content.trim()}\n\`\`\``
-                            }
-                            if (c.type === 'list' && Array.isArray(c.items)) {
-                                return c.items
-                                    .map((item, idx) => c.listType === 'ol' ? `${idx + 1}. ${String(item).trim()}` : `• ${String(item).trim()}`)
-                                    .join('\n')
-                                    .trim()
-                            }
-                            return ''
-                        }).filter(Boolean).join('\n\n').trim()
+                        text = streamDataToText(data.data)
                     }
                     if (!files.length && data?.data?.chunks?.length) {
                         const seen = new Set()
@@ -1689,7 +1815,11 @@ async function connectToWhatsApp(tenantId, forceReset = false) {
             const fullPrompt = `${businessCtx ? `EMPRESA:\n${businessCtx}\n\n` : ''}INSTRUÇÕES:\n${basePrompt}${resolvedMemory}${longTermMemory}${senderProfile}${groupCtx}${activeGroupCtx}${styleInstruction}${sizeInstruction}${ttsInstruction}\n\nMENSAGEM DE ${author}: ${resolvedCleanText || 'Oi!'}`
 
             try {
-                const aiResult = await getAIResponse(fullPrompt, configs, null, { includeMeta: true })
+                const liveStateKey = streamStateKey(tenantId, remoteJid)
+                const aiResult = await getAIResponse(fullPrompt, configs, null, {
+                    includeMeta: true,
+                    onStream: (eventData) => handleRealtimeAIStreamEvent(sock, remoteJid, liveStateKey, eventData)
+                })
                 const response = typeof aiResult === 'string' ? aiResult : (aiResult?.text || null)
                 const files = Array.isArray(aiResult?.files) ? aiResult.files : []
                 if (response || files.length) {
@@ -1706,7 +1836,9 @@ async function connectToWhatsApp(tenantId, forceReset = false) {
                 } else {
                     if (isPV) await sock.sendMessage(remoteJid, { text: 'Sem conexão com o modelo agora, tenta de novo!' }, { quoted: msg })
                 }
+                await stopRealtimeComposing(sock, remoteJid, liveStateKey)
             } catch (err) {
+                await stopRealtimeComposing(sock, remoteJid, streamStateKey(tenantId, remoteJid))
                 console.error(`[RESP] Erro:`, err.message)
                 if (isPV) await sock.sendMessage(remoteJid, { text: 'Erro interno. Tenta de novo!' }, { quoted: msg })
             }
