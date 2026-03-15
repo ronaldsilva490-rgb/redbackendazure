@@ -984,28 +984,28 @@ async function loadTenantAIConfigs(tenantId) {
         const isAdmin = tenantId === ADMIN_TENANT_ID
 
         if (isAdmin) {
-            const { data, error } = await supabase.from('ai_configs').select('*')
+            const { data: globalData, error } = await supabase.from('ai_configs').select('*')
+            const { data: tenantData } = await supabase.from('whatsapp_tenant_configs').select('*').eq('tenant_id', 'admin').maybe_single()
+            
             const configs = {}
-            if (!error && data) {
-                // Tenta pegar de linhas (key/value) ou de colunas da primeira linha
-                data.forEach(item => {
+            if (!error && globalData) {
+                globalData.forEach(item => {
                     if (item.key) configs[item.key] = item.value
                 })
-                // Se houver colunas extras na primeira linha (caso o user tenha usado ALTER TABLE)
-                const firstRow = data[0] || {}
-                if (firstRow.red_instance_id) configs.red_instance_id = firstRow.red_instance_id
-                if (firstRow.red_proxy_url) configs.red_proxy_url = firstRow.red_proxy_url
             }
-            const provider = configs.ai_provider || 'gemini'
+
+            // Prioriza o que está na tabela de integração (onde o dashboard salva)
+            const d = tenantData || {}
+            const provider = d.ai_provider || configs.ai_provider || 'gemini'
 
             configData = {
                 chat: {
-                    provider: configs.chat_provider || provider,
-                    api_key: configs[`${configs.chat_provider || provider}_api_key`] || configs[`${provider}_api_key`] || process.env.GEMINI_API_KEY || '',
-                    model: configs.chat_model || configs[`${provider}_model`] || 'gemini-2.0-flash',
-                    system_prompt: configs.chat_system_prompt || configs[`${provider}_system_prompt`] || 'Você é o assistente RED.IA.',
-                    red_instance_id: configs.red_instance_id || '',
-                    red_proxy_url: configs.red_proxy_url || ''
+                    provider: d.chat_provider || d.ai_provider || configs.chat_provider || provider,
+                    api_key: d.chat_api_key || d.api_key || configs[`${configs.chat_provider || provider}_api_key`] || configs[`${provider}_api_key`] || process.env.GEMINI_API_KEY || '',
+                    model: d.chat_model || d.model || configs.chat_model || configs[`${provider}_model`] || 'gemini-2.0-flash',
+                    system_prompt: d.system_prompt || configs.chat_system_prompt || configs[`${provider}_system_prompt`] || 'Você é o assistente RED.IA.',
+                    red_instance_id: d.red_instance_id || configs.red_instance_id || '',
+                    red_proxy_url: d.red_proxy_url || configs.red_proxy_url || ''
                 },
                 stt: {
                     provider: configs.stt_provider || 'groq',
