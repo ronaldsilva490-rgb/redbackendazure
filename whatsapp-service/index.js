@@ -473,13 +473,16 @@ async function getAIResponse(prompt, configs, overrideSystemPrompt = null) {
     console.log("[AI-DEBUG] Configs recebidas:", JSON.stringify(configs, null, 2));
 
     const chatCfg = configs.chat || {}
-    const provider = chatCfg.provider || configs.ai_provider || 'gemini'
+    // PRIORIDADE: Se o provedor global ou o do chat for red-claude, usamos o proxy
+    const provider = configs.ai_provider === 'red-claude' || chatCfg.provider === 'red-claude' ? 'red-claude' : (chatCfg.provider || configs.ai_provider || 'gemini')
+    
     const apiKey = chatCfg.api_key || configs.api_key || ''
     const model = chatCfg.model || configs.model || ''
     const systemPrompt = overrideSystemPrompt || chatCfg.system_prompt || configs.system_prompt || 'Você é um assistente.'
 
     if (provider === 'red-claude') {
-        const instanceId = chatCfg.red_instance_id || configs.red_instance_id;
+        // Busca o ID da instância em qualquer lugar possível do objeto
+        const instanceId = chatCfg.red_instance_id || configs.red_instance_id || configs.red_instance_id;
         
         if (!instanceId) {
             console.error(`[AI] RED Claude selecionado para ${configs.tenant_id || 'unknown'}, mas red_instance_id não encontrado.`);
