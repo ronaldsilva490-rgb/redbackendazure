@@ -69,6 +69,7 @@ const supabase = createClient(
 const ADMIN_TENANT_ID = process.env.ADMIN_TENANT_ID || 'admin'
 const sessions = new Map()
 const conversationBuffers = new Map()
+const waSessionDispatchState = new Map()
 
 // ── Controle de proatividade e atividade por conversa ──
 const lastProactiveTime     = new Map() // tenantId_jid → timestamp último proativo
@@ -676,6 +677,51 @@ async function sendRemoteFilesToWhatsApp(sock, remoteJid, files, quotedMsg, capt
     }
     return sentAny
 }
+
+function normalizeIncomingFiles(files) {
+    if (!Array.isArray(files)) return []
+    return files
+        .filter(f => (typeof f?.url === 'string' && f.url.trim()) || (typeof f?.dataBase64 === 'string' && f.dataBase64.trim()))
+        .map(f => ({
+            name: typeof f?.name === 'string' && f.name.trim() ? f.name.trim() : 'arquivo',
+            url: typeof f?.url === 'string' ? f.url.trim() : '',
+            mimeType: typeof f?.mimeType === 'string' && f.mimeType.trim() ? f.mimeType.trim() : 'application/octet-stream',
+            dataBase64: typeof f?.dataBase64 === 'string' ? f.dataBase64.trim() : ''
+        }))
+}
+
+function fileFingerprint(file) {
+    const name = (file?.name || 'arquivo').trim().toLowerCase()
+    const mime = (file?.mimeType || 'application/octet-stream').trim().toLowerCase()
+    const url = (file?.url || '').trim()
+    const b64Len = typeof file?.dataBase64 === 'string' ? file.dataBase64.length : 0
+    return `${name}|${mime}|${url}|${b64Len}`
+}
+
+async function handleAsyncFilesFromProxy(data) {
+    if (data?.action !== 'NEURAL_FILES_READY') return
+    const sessionId = typeof data?.sessionId === 'string' ? data.sessionId : ''
+    if (!sessionId || !sessionId.startsWith('WA_')) return
+    const state = waSessionDispatchState.get(sessionId)
+    if (!state?.sock || !state?.remoteJid) return
+    const incoming = normalizeIncomingFiles(data.files)
+    if (!incoming.length) return
+    const newFiles = incoming.filter((f) => {
+        const fp = fileFingerprint(f)
+        if (state.sentFileFingerprints.has(fp)) return false
+        state.sentFileFingerprints.add(fp)
+        return true
+    })
+    if (!newFiles.length) return
+    try {
+        await sendRemoteFilesToWhatsApp(state.sock, state.remoteJid, newFiles, null, '')
+        state.updatedAt = Date.now()
+    } catch (_) {}
+}
+
+eventEmitter.on('proxy_message', (data) => {
+    handleAsyncFilesFromProxy(data).catch(() => {})
+})
 
 // ══════════════════════════════════════════════════
 // CORE IA — Geração de Resposta
@@ -1803,12 +1849,24 @@ async function connectToWhatsApp(tenantId, forceReset = false) {
 
             try {
                 const liveStateKey = streamStateKey(tenantId, remoteJid)
+                const aiSessionId = `WA_${tenantId || 'default'}`
+                waSessionDispatchState.set(aiSessionId, {
+                    sock,
+                    remoteJid,
+                    updatedAt: Date.now(),
+                    sentFileFingerprints: new Set()
+                })
                 const aiResult = await getAIResponse(fullPrompt, configs, null, {
                     includeMeta: true,
                     onStream: (eventData) => handleRealtimeAIStreamEvent(sock, remoteJid, liveStateKey, eventData)
                 })
                 const response = typeof aiResult === 'string' ? aiResult : (aiResult?.text || null)
                 const files = Array.isArray(aiResult?.files) ? aiResult.files : []
+                const state = waSessionDispatchState.get(aiSessionId)
+                if (state) {
+                    files.forEach((f) => state.sentFileFingerprints.add(fileFingerprint(f)))
+                    state.updatedAt = Date.now()
+                }
                 if (response || files.length) {
                     // Às vezes envia sticker junto (só em grupos animados)
                     if (isGroup && isActiveGroup && Math.random() < 0.08) {
@@ -1823,6 +1881,13 @@ async function connectToWhatsApp(tenantId, forceReset = false) {
                 } else {
                     if (isPV) await sock.sendMessage(remoteJid, { text: 'Sem conexão com o modelo agora, tenta de novo!' }, { quoted: msg })
                 }
+                setTimeout(() => {
+                    const latest = waSessionDispatchState.get(aiSessionId)
+                    if (!latest) return
+                    if (Date.now() - (latest.updatedAt || 0) >= 180000) {
+                        waSessionDispatchState.delete(aiSessionId)
+                    }
+                }, 185000)
                 await stopRealtimeComposing(sock, remoteJid, liveStateKey)
             } catch (err) {
                 await stopRealtimeComposing(sock, remoteJid, streamStateKey(tenantId, remoteJid))
