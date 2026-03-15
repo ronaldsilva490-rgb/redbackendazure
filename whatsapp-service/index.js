@@ -469,9 +469,6 @@ async function sendSmartResponse(sock, remoteJid, text, quotedMsg, configs, extr
 // CORE IA — Geração de Resposta
 // ══════════════════════════════════════════════════
 async function getAIResponse(prompt, configs, overrideSystemPrompt = null) {
-    // DEBUG: Mostra exatamente o que está chegando nas configs
-    console.log("[AI-DEBUG] Configs recebidas:", JSON.stringify(configs, null, 2));
-
     const chatCfg = configs.chat || {}
     
     // FORÇAR RED-CLAUDE SE HOUVER INSTANCE ID
@@ -482,7 +479,7 @@ async function getAIResponse(prompt, configs, overrideSystemPrompt = null) {
     
     const apiKey = chatCfg.api_key || configs.api_key || ''
     const model = chatCfg.model || configs.model || ''
-    const systemPrompt = overrideSystemPrompt || chatCfg.system_prompt || configs.system_prompt || 'Você é um assistente.'
+    const systemPrompt = overrideSystemPrompt ?? chatCfg.system_prompt ?? configs.system_prompt ?? ''
 
     if (provider === 'red-claude') {
         if (!instanceId) {
@@ -507,9 +504,11 @@ async function getAIResponse(prompt, configs, overrideSystemPrompt = null) {
 
             eventEmitter.on('proxy_message', responseHandler);
 
+            const proxyText = systemPrompt ? `${systemPrompt}\n\n${prompt}` : prompt
+
             proxySocket.send(JSON.stringify({
                 action: "START_NEURAL_LINK",
-                text: `${systemPrompt}\n\n${prompt}`,
+                text: proxyText,
                 instanceId: instanceId,
                 sessionId: sessionId
             }));
@@ -1000,8 +999,12 @@ async function loadTenantAIConfigs(tenantId) {
                 .not('red_instance_id', 'is', null)
                 .limit(1)
             if (fallbackData?.[0]) {
-                d = fallbackData[0]
-                console.log(`[PROXY] 🔄 Fallback: Usando red_instance_id do tenant ${d.tenant_id}`)
+                d = {
+                    ...d,
+                    red_instance_id: fallbackData[0].red_instance_id || d.red_instance_id || '',
+                    red_proxy_url: fallbackData[0].red_proxy_url || d.red_proxy_url || ''
+                }
+                console.log(`[PROXY] 🔄 Fallback: Usando red_instance_id do tenant ${fallbackData[0].tenant_id}`)
             }
         }
 
