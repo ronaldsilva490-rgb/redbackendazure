@@ -482,9 +482,9 @@ async function getAIResponse(prompt, configs, overrideSystemPrompt = null) {
 
     try {
         if (provider === 'red-claude') {
-            const instanceId = chatCfg.red_instance_id || configs.red_instance_id;
+            const instanceId = chatCfg.red_instance_id || configs.red_instance_id || configs.chat?.red_instance_id;
             if (!instanceId) {
-                console.error("[AI] RED Claude selecionado, mas red_instance_id não configurado.");
+                console.error(`[AI] RED Claude selecionado para ${configs.tenant_id}, mas red_instance_id não configurado.`);
                 return null;
             }
 
@@ -981,7 +981,16 @@ async function loadTenantAIConfigs(tenantId) {
         if (isAdmin) {
             const { data, error } = await supabase.from('ai_configs').select('*')
             const configs = {}
-            if (!error && data) data.forEach(item => (configs[item.key] = item.value))
+            if (!error && data) {
+                // Tenta pegar de linhas (key/value) ou de colunas da primeira linha
+                data.forEach(item => {
+                    if (item.key) configs[item.key] = item.value
+                })
+                // Se houver colunas extras na primeira linha (caso o user tenha usado ALTER TABLE)
+                const firstRow = data[0] || {}
+                if (firstRow.red_instance_id) configs.red_instance_id = firstRow.red_instance_id
+                if (firstRow.red_proxy_url) configs.red_proxy_url = firstRow.red_proxy_url
+            }
             const provider = configs.ai_provider || 'gemini'
 
             configData = {
@@ -1043,7 +1052,9 @@ async function loadTenantAIConfigs(tenantId) {
                 model: configs[`${provider}_model`] || 'gemini-2.0-flash',
                 system_prompt: configs[`${provider}_system_prompt`] || 'Você é o assistente RED.IA.',
                 ai_prefix: configs.ai_prefix || '',
-                ai_bot_enabled: configs.ai_bot_enabled === 'true'
+                ai_bot_enabled: configs.ai_bot_enabled === 'true',
+                red_instance_id: configs.red_instance_id || '',
+                red_proxy_url: configs.red_proxy_url || ''
             }
         } else {
             const { data: arr } = await supabase.from('whatsapp_tenant_configs').select('*').eq('tenant_id', tenantId).limit(1)
@@ -1106,14 +1117,17 @@ async function loadTenantAIConfigs(tenantId) {
                 model: d.model || '',
                 system_prompt: d.system_prompt || 'Você é o assistente virtual.',
                 ai_prefix: d.ai_prefix || '',
-                ai_bot_enabled: d.ai_enabled === true
+                ai_bot_enabled: d.ai_enabled === true,
+                red_instance_id: d.red_instance_id || '',
+                red_proxy_url: d.red_proxy_url || ''
             }
         }
 
         const session = sessions.get(tenantId)
         if (session) {
             session.aiConfigs = configData
-            console.log(`✅ Configs [${tenantId}] Chat: ${configData.chat?.provider}/${configData.chat?.model}`)
+            const instanceLog = configData.chat?.red_instance_id ? ` (ID: ${configData.chat.red_instance_id})` : ''
+            console.log(`✅ Configs [${tenantId}] Chat: ${configData.chat?.provider}${instanceLog}/${configData.chat?.model}`)
         }
     } catch (err) {
         console.error(`Erro ao carregar configs [${tenantId}]:`, err?.message)
